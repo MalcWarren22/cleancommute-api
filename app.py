@@ -12,9 +12,7 @@ from pymongo import MongoClient
 from bson import ObjectId
 from werkzeug.middleware.proxy_fix import ProxyFix
 
-# ---------------------------------------
-# App Factory
-# ---------------------------------------
+
 def create_app() -> Flask:
     app = Flask(__name__)
     app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)  # type: ignore
@@ -24,7 +22,7 @@ def create_app() -> Flask:
     app.config["MONGO_URI"] = os.getenv("MONGO_URI", "")
     app.config["MONGO_DB"] = os.getenv("MONGO_DB", "cleancommute")
     app.config["DEFAULT_LIMITS"] = os.getenv("DEFAULT_LIMITS", "100 per 15 minutes")
-    # Accept several truthy values so CI can pass "true" or "1"
+    # Accept common truthy values
     app.config["ALLOW_CLEAR"] = os.getenv("ALLOW_CLEAR", "false").strip().lower() in (
         "true",
         "1",
@@ -38,12 +36,11 @@ def create_app() -> Flask:
         raise RuntimeError("MONGO_URI is required")
 
     # ---------- CORS ----------
-    # If FRONTEND_ORIGIN is unset, allow all in dev/test to avoid CORS headaches.
     cors_origin = app.config["FRONTEND_ORIGIN"] or "*"
     CORS(app, resources={r"/api/*": {"origins": cors_origin}})
 
     # ---------- Rate Limiter ----------
-    limiter_storage = os.getenv("LIMITER_STORAGE_URI")  # e.g., redis://...
+    limiter_storage = os.getenv("LIMITER_STORAGE_URI")  # e.g., rediss://...
     limiter = Limiter(
         key_func=get_remote_address,
         default_limits=[app.config["DEFAULT_LIMITS"]],
@@ -72,14 +69,12 @@ def create_app() -> Flask:
         return current_app.response_class(body, mimetype="application/json", status=status)
 
     def parse_limit(default: int = 100, maximum: int = 500) -> int:
-        """Read ?limit= from querystring, clamp between 1..maximum."""
         try:
             n = int(request.args.get("limit", default))
         except (TypeError, ValueError):
             n = default
         return max(1, min(maximum, n))
 
-    # --- 401 for missing/invalid API key ---
     def require_api_key(f):
         @wraps(f)
         def wrapper(*args, **kwargs):
@@ -104,7 +99,6 @@ def create_app() -> Flask:
 
     @app.errorhandler(Exception)
     def unhandled_error(e):
-        # Keep simple, consistent JSON for CI and clients
         return json_ok({"error": "internal_error", "detail": str(e)}, 500)
 
     # ---------- Routes ----------
