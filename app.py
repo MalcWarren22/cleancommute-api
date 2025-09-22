@@ -40,8 +40,8 @@ if os.getenv("ENABLE_HTTPS_HEADERS", "1").lower() not in ("0", "false", "no"):
         content_security_policy=None,  # API-only; no CSP needed
     )
 
-# Rate limiting storage: Redis in prod; memory fallback for local/dev
-storage_uri = os.getenv("REDIS_URL", "memory://")
+# Rate limiting storage: **force memory by default**; opt in to Redis by setting LIMITER_STORAGE_URI
+storage_uri = os.getenv("LIMITER_STORAGE_URI", "memory://")
 limiter = Limiter(key_func=get_remote_address, storage_uri=storage_uri)
 limiter.init_app(app)
 
@@ -99,8 +99,11 @@ def _estimate_emissions_local(distance_km: float, mode: str) -> dict:
 def ensure_indexes():
     if db is None:
         return
-    db.samples.create_index([("createdAt", -1)])
-    db.commutes.create_index([("createdAt", -1)])
+    try:
+        db.samples.create_index([("createdAt", -1)])
+        db.commutes.create_index([("createdAt", -1)])
+    except Exception as e:
+        log.warning("index creation skipped: %s", e)
 ensure_indexes()
 
 # ----- Errors -----
@@ -247,8 +250,8 @@ def v1_samples_get():
         return {"error": "db read failed", "detail": str(e)}, 500
 
 @api.post("/samples")
-@limiter.limit("20/minute")
 @require_api_key
+@limiter.limit("20/minute")
 def v1_samples_post():
     try:
         return samples_post_impl()
@@ -256,8 +259,8 @@ def v1_samples_post():
         return {"error": "db write failed", "detail": str(e)}, 500
 
 @api.post("/samples/clear")
-@limiter.limit("5/minute")
 @require_api_key
+@limiter.limit("5/minute")
 def v1_samples_clear():
     try:
         return samples_clear_impl()
@@ -265,8 +268,8 @@ def v1_samples_clear():
         return {"error": "db clear failed", "detail": str(e)}, 500
 
 @api.post("/commutes")
-@limiter.limit("20/minute")
 @require_api_key
+@limiter.limit("20/minute")
 def v1_commutes_post():
     try:
         return commutes_post_impl()
@@ -281,8 +284,8 @@ def v1_commutes_get():
         return {"error": "db read failed", "detail": str(e)}, 500
 
 @api.post("/commutes/clear")
-@limiter.limit("5/minute")
 @require_api_key
+@limiter.limit("5/minute")
 def v1_commutes_clear():
     try:
         return commutes_clear_impl()
