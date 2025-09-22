@@ -1,3 +1,4 @@
+
 # app.py
 from flask import Flask, jsonify, request
 from pymongo import MongoClient, errors
@@ -56,10 +57,10 @@ def add_sample():
     data = request.get_json(silent=True) or {}
     if not isinstance(data, dict):
         return {"error": "JSON body must be an object"}, 400
-
+    
     # Add a server-side timestamp
     data["createdAt"] = datetime.now(timezone.utc)
-
+    
     try:
         result = db.samples.insert_one(data)
         return {"inserted_id": str(result.inserted_id)}, 201
