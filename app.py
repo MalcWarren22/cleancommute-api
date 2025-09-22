@@ -1,65 +1,73 @@
 import os
-from functools import wraps
-from datetime import datetime
-from typing import Any
-
-from flask import Flask, request, current_app
+from flask import Flask, request, current_app, Response
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from pymongo import MongoClient
-from bson import ObjectId
-from werkzeug.middleware.proxy_fix import ProxyFix
+from emissions import estimate_emissions
+from urllib.parse import urlparse
 
 
-def create_app() -> Flask:
+def create_app():
     app = Flask(__name__)
+    CORS(app)
 
-    # Security headers, proxy fix for Heroku
-    app.wsgi_app = ProxyFix(app.wsgi_app)
+    # --- MongoDB Setup ---
+    mongo_uri = os.environ.get("MONGO_URI")
+    if not mongo_uri:
+        raise RuntimeError("MONGO_URI is not set")
 
-    # Enable CORS
-    CORS(app, origins=os.getenv("ALLOWED_ORIGINS", "*").split(","))
+    mongo_client = MongoClient(mongo_uri)
 
-    # Rate limiting
+    # Extract DB name from URI (fallback to "cleancommute")
+    parsed = urlparse(mongo_uri)
+    db_name = parsed.path.lstrip("/") or "cleancommute"
+    app.db = mongo_client[db_name]
+
+    # --- Rate Limiting ---
     limiter = Limiter(
-        key_func=get_remote_address,
-        default_limits=[os.getenv("DEFAULT_LIMITS", "200 per day;50 per hour")],
-        storage_uri=os.getenv("LIMITER_STORAGE_URI", "memory://"),
+        get_remote_address,
+        app=app,
+        storage_uri=os.environ.get("LIMITER_STORAGE_URI", "memory://"),
+        default_limits=[os.environ.get("DEFAULT_LIMITS", "60 per minute")],
     )
-    limiter.init_app(app)
 
-    # MongoDB setup
-    mongo_client = MongoClient(os.getenv("MONGO_URI"))
-    app.db = mongo_client.get_default_database()
-
-    # Health route
+    # --- Routes ---
     @app.route("/api/v1/health")
     def health():
-        return {"status": "ok", "ts": datetime.utcnow().isoformat()}
+        """Simple health check with DB name for debugging."""
+        return {"status": "ok", "db": db_name}, 200
 
-    # Example protected route
-    def require_api_key(f):
-        @wraps(f)
-        def decorated(*args, **kwargs):
-            api_key = os.getenv("API_KEY")
-            if request.headers.get("x-api-key") != api_key:
-                return {"error": "unauthorized"}, 401
-            return f(*args, **kwargs)
-        return decorated
+    @app.route("/api/v1/commutes", methods=["POST"])
+    @limiter.limit("10 per minute")
+    def add_commute():
+        """Add a commute record and return emissions estimate."""
+        data = request.json or {}
+        distance = data.get("distance_km", 0)
+        mode = data.get("mode", "car")
+        passengers = data.get("passengers", 1)
 
-    @app.route("/api/v1/samples", methods=["GET"])
-    @require_api_key
-    def get_samples():
-        items = list(app.db.samples.find())
-        for item in items:
-            item["_id"] = str(item["_id"])
-        return {"samples": items}
+        estimate = estimate_emissions(distance, mode, passengers=passengers)
+        app.db.commutes.insert_one({**data, **estimate})
+        return estimate, 201
+
+    @app.route("/api/v1/commutes", methods=["GET"])
+    def list_commutes():
+        """List all commute records."""
+        commutes = list(app.db.commutes.find({}, {"_id": 0}))
+        return {"commutes": commutes}
+
+    @app.route("/api/v1/commutes/clear", methods=["POST"])
+    def clear_commutes():
+        """Clear all commute records (dev only)."""
+        app.db.commutes.delete_many({})
+        return {"cleared": True}
 
     return app
 
 
+# Entrypoint for Heroku / gunicorn
 app = create_app()
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
