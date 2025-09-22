@@ -122,19 +122,38 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Heroku CLI
-        uses: heroku/actions/setup@v2
+      - name: Install Heroku CLI
+        run: |
+          curl https://cli-assets.heroku.com/install-ubuntu.sh | sh
 
-      - name: Deploy via git to Heroku (staging)
-        uses: heroku/actions/deploy-via-git@v2
-        with:
-          heroku_api_key: ${{ secrets.HEROKU_API_KEY }}
-          heroku_app_name: ${{ vars.HEROKU_APP_STAGING }}
-          branch: staging
+      - name: Authenticate Heroku
+        env:
+          HEROKU_API_KEY: ${{ secrets.HEROKU_API_KEY }}
+          HEROKU_EMAIL: ${{ secrets.HEROKU_EMAIL }}
+        run: |
+          cat > ~/.netrc <<EOF
+          machine api.heroku.com
+            login $HEROKU_EMAIL
+            password $HEROKU_API_KEY
+          machine git.heroku.com
+            login $HEROKU_EMAIL
+            password $HEROKU_API_KEY
+          EOF
+          heroku auth:whoami || true
+
+      - name: Deploy via git push (staging)
+        env:
+          HEROKU_API_KEY: ${{ secrets.HEROKU_API_KEY }}
+          HEROKU_APP: ${{ vars.HEROKU_APP_STAGING }}
+        run: |
+          heroku git:remote -a "$HEROKU_APP"
+          git config user.email "${{ secrets.HEROKU_EMAIL }}"
+          git config user.name "GitHub Actions"
+          git fetch --unshallow || true
+          git push https://heroku:${HEROKU_API_KEY}@git.heroku.com/${HEROKU_APP}.git HEAD:main -f
 
       - name: (Optional) Set config vars (staging) if provided
         env:
-          HEROKU_API_KEY: ${{ secrets.HEROKU_API_KEY }}
           HEROKU_APP: ${{ vars.HEROKU_APP_STAGING }}
           API_KEY: ${{ secrets.API_KEY_STAGING }}
           MONGO_URI: ${{ secrets.MONGO_URI_STAGING }}
@@ -174,19 +193,38 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Heroku CLI
-        uses: heroku/actions/setup@v2
+      - name: Install Heroku CLI
+        run: |
+          curl https://cli-assets.heroku.com/install-ubuntu.sh | sh
 
-      - name: Deploy via git to Heroku (prod)
-        uses: heroku/actions/deploy-via-git@v2
-        with:
-          heroku_api_key: ${{ secrets.HEROKU_API_KEY }}
-          heroku_app_name: ${{ vars.HEROKU_APP_PROD }}
-          branch: main
+      - name: Authenticate Heroku
+        env:
+          HEROKU_API_KEY: ${{ secrets.HEROKU_API_KEY }}
+          HEROKU_EMAIL: ${{ secrets.HEROKU_EMAIL }}
+        run: |
+          cat > ~/.netrc <<EOF
+          machine api.heroku.com
+            login $HEROKU_EMAIL
+            password $HEROKU_API_KEY
+          machine git.heroku.com
+            login $HEROKU_EMAIL
+            password $HEROKU_API_KEY
+          EOF
+          heroku auth:whoami || true
+
+      - name: Deploy via git push (prod)
+        env:
+          HEROKU_API_KEY: ${{ secrets.HEROKU_API_KEY }}
+          HEROKU_APP: ${{ vars.HEROKU_APP_PROD }}
+        run: |
+          heroku git:remote -a "$HEROKU_APP"
+          git config user.email "${{ secrets.HEROKU_EMAIL }}"
+          git config user.name "GitHub Actions"
+          git fetch --unshallow || true
+          git push https://heroku:${HEROKU_API_KEY}@git.heroku.com/${HEROKU_APP}.git HEAD:main -f
 
       - name: (Optional) Set config vars (prod) if provided
         env:
-          HEROKU_API_KEY: ${{ secrets.HEROKU_API_KEY }}
           HEROKU_APP: ${{ vars.HEROKU_APP_PROD }}
           API_KEY: ${{ secrets.API_KEY_PROD }}
           MONGO_URI: ${{ secrets.MONGO_URI_PROD }}
