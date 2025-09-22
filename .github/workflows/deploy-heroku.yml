@@ -9,7 +9,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0     # ← full history (not shallow)
+          fetch-depth: 0     # full history (not shallow)
 
       - name: Install Heroku CLI
         run: curl https://cli-assets.heroku.com/install-ubuntu.sh | sh
@@ -39,6 +39,9 @@ jobs:
           fi
 
       - name: Push to Heroku
+        env:
+          APP_NAME: clean-commute-api-python   # <-- fixed (with dash)
         run: |
-          heroku git:remote -a cleancommute-api-python
+          git remote remove heroku 2>/dev/null || true
+          heroku git:remote -a "$APP_NAME"
           git push heroku HEAD:main
