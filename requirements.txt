@@ -8,3 +8,5 @@ itsdangerous
 flask-talisman
 flask-limiter
 redis
+certifi
+Werkzeug
