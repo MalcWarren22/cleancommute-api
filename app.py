@@ -1,315 +1,238 @@
-from flask import Flask, jsonify, request, Blueprint
-from flask_cors import CORS
-from pymongo import MongoClient, errors
-from dotenv import load_dotenv
+# app.py
+from __future__ import annotations
+
+import logging
+import os
+import ssl
 from datetime import datetime, timezone
-from werkzeug.exceptions import HTTPException
-from pydantic import BaseModel, Field, ValidationError
 from typing import Optional
-from werkzeug.middleware.proxy_fix import ProxyFix
-from flask_talisman import Talisman
-from functools import wraps
+
+from flask import Flask, jsonify, request
+from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
-import hmac, logging, sys, os
+from flask_talisman import Talisman
+from pydantic import BaseModel, Field, ValidationError
+from pymongo import MongoClient, ASCENDING, DESCENDING
+from werkzeug.exceptions import HTTPException
 
-# ----- Setup / DB -----
-load_dotenv(".env")
-MONGO_URI = os.getenv("MONGO_URI")
-client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000, retryWrites=True) if MONGO_URI else None
-db = client["cleancommute"] if client else None
+# ---------- Config / env ----------
+API_PREFIX = "/api/v1"
 
+MONGO_URI = os.environ.get("MONGO_URI", "")
+API_KEY = os.environ.get("API_KEY", "")  # set on Heroku
+ALLOW_CLEAR = os.environ.get("ALLOW_CLEAR", "0") == "1"
+
+FRONTEND_ORIGIN = os.environ.get("FRONTEND_ORIGIN", "http://localhost:3000")
+ALLOWED_ORIGINS = [FRONTEND_ORIGIN]
+
+LIMITER_STORAGE_URI = os.environ.get("LIMITER_STORAGE_URI")  # e.g. rediss://...
+LIMITER_INSECURE_SSL = os.environ.get("LIMITER_INSECURE_SSL", "0") == "1"  # only if your Redis TLS chain is funky
+DEFAULT_LIMITS = os.environ.get("DEFAULT_LIMITS", "200 per hour;50 per minute")
+
+# ---------- App ----------
 app = Flask(__name__)
+app.json.sort_keys = False
 
-# Trust Heroku's reverse proxy (honor X-Forwarded-Proto)
-app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
-
-# CORS: allow only origins from env var (comma-separated). Use "*" in dev if needed.
-origins_env = os.getenv("ALLOWED_ORIGINS", "*")
-allowed_origins = [o.strip() for o in origins_env.split(",")] if origins_env else ["*"]
-CORS(app, resources={r"/api/*": {"origins": allowed_origins}}, supports_credentials=False)
-
-# HTTPS/HSTS headers + http→https redirect (disable with ENABLE_HTTPS_HEADERS=0)
-if os.getenv("ENABLE_HTTPS_HEADERS", "1").lower() not in ("0", "false", "no"):
-    Talisman(
-        app,
-        force_https=True,
-        strict_transport_security=True,
-        strict_transport_security_preload=True,
-        strict_transport_security_max_age=31536000,  # 1 year
-        content_security_policy=None,  # API-only; no CSP needed
-    )
-
-# Rate limiting storage: **force memory by default**; opt in to Redis by setting LIMITER_STORAGE_URI
-storage_uri = os.getenv("LIMITER_STORAGE_URI", "memory://")
-limiter = Limiter(key_func=get_remote_address, storage_uri=storage_uri)
-limiter.init_app(app)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
+# Security headers + HTTPS redirect on Heroku
+Talisman(
+    app,
+    force_https=True,
+    strict_transport_security=True,
+    content_security_policy=None,  # no CSP for JSON API
 )
-log = logging.getLogger(__name__)
 
-# Try to use user's emissions.py if present
-try:
-    from emissions import estimate_emissions as _external_estimate_emissions  # (distance_km, mode, **extras) -> dict
-except Exception:
-    _external_estimate_emissions = None
+# CORS (echo only if origin matches our allowlist)
+CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}}, supports_credentials=False, max_age=3600)
 
-# ----- Security: API key (supports rotation via API_KEY + API_KEY_OLD) -----
-API_KEYS = [k for k in (os.getenv("API_KEY", ""), os.getenv("API_KEY_OLD", "")) if k]
+# Rate limiting (Redis if configured, else in-memory)
+storage_options = {}
+if LIMITER_STORAGE_URI and LIMITER_STORAGE_URI.startswith("rediss://") and LIMITER_INSECURE_SSL:
+    # Heroku Redis sometimes sits behind a TLS proxy with a self-signed link in the chain.
+    storage_options["ssl_cert_reqs"] = ssl.CERT_NONE  # noqa: S501
 
-def require_api_key(fn):
-    @wraps(fn)
-    def _wrap(*args, **kwargs):
-        sent = request.headers.get("x-api-key", "")
-        if not API_KEYS or not any(hmac.compare_digest(sent, k) for k in API_KEYS):
-            return {"error": "unauthorized"}, 401
-        return fn(*args, **kwargs)
-    return _wrap
+limiter = Limiter(
+    key_func=get_remote_address,
+    app=app,
+    storage_uri=LIMITER_STORAGE_URI or "memory://",
+    storage_options=storage_options or None,
+    default_limits=DEFAULT_LIMITS.split(";") if DEFAULT_LIMITS else [],
+    strategy="fixed-window",
+)
 
-# ----- Helpers -----
-def _serialize(doc):
-    out = {}
-    for k, v in doc.items():
-        if isinstance(v, datetime):
-            out[k] = v.astimezone(timezone.utc).isoformat()
-        else:
-            out[k] = v
-    return out
+# ---------- DB ----------
+if not MONGO_URI:
+    raise RuntimeError("MONGO_URI is required")
 
-def _estimate_emissions_local(distance_km: float, mode: str) -> dict:
-    EF = {
-        "car": 0.192,
-        "car_gas": 0.192,
-        "car_hybrid": 0.120,
-        "rideshare": 0.212,
-        "bus": 0.082,
-        "train": 0.041,
-        "subway": 0.045,
-        "bike": 0.0,
-        "walk": 0.0,
-    }
-    f = EF.get((mode or "").lower(), EF["car"])
-    kg = round(distance_km * f, 4)
-    return {"kgCO2e": kg, "factor_kg_per_km": f, "mode": mode, "source": "local_fallback"}
+mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+db = mongo_client["cleancommute"]
+assert db is not None
 
-def ensure_indexes():
-    if db is None:
-        return
-    try:
-        db.samples.create_index([("createdAt", -1)])
-        db.commutes.create_index([("createdAt", -1)])
-    except Exception as e:
-        log.warning("index creation skipped: %s", e)
-ensure_indexes()
+# Helpful indexes (idempotent)
+db.samples.create_index([("createdAt", DESCENDING)])
+db.commutes.create_index([("createdAt", DESCENDING)])
 
-# ----- Errors -----
-@app.errorhandler(HTTPException)
-def handle_http_err(e):
-    return {"error": e.name, "detail": e.description}, e.code
+# ---------- Auth ----------
+def require_api_key() -> Optional[tuple[dict, int]]:
+    if not API_KEY:
+        return None  # no API key set -> allow (dev mode)
+    supplied = request.headers.get("x-api-key")
+    if supplied != API_KEY:
+        return jsonify({"error": "unauthorized", "detail": "invalid or missing API key"}), 401
+    return None
 
-@app.errorhandler(Exception)
-def handle_any_err(e):
-    log.exception("unhandled_error")
-    return {"error": "internal_error", "detail": str(e)}, 500
 
-# ----- Root -----
-@app.get("/")
-def root():
-    return {"service": "cleancommute-api", "version": "v1"}
-
-# ----- Validation models -----
+# ---------- Validation models ----------
 class SampleIn(BaseModel):
-    name: str = Field(min_length=1, max_length=100)
-    status: str = Field(min_length=1, max_length=40)
+    name: str = Field(min_length=1)
+    status: str = Field(min_length=1)
+
 
 class CommuteIn(BaseModel):
     distance_km: float = Field(gt=0)
-    mode: str = Field(min_length=1, max_length=40)
+    mode: str = Field(pattern="^(car|bus|train|bike|walk)$")
     origin: Optional[str] = None
     destination: Optional[str] = None
+    passengers: int = Field(default=1, ge=1)
 
-# ----- Core impls (shared) -----
-def health_impl():
-    return {"status": "ok"}
 
-def db_ping_impl():
-    if db is None:
-        return {"db": "missing_config"}, 503
+# ---------- Emissions ----------
+# Fallback simple factors (kg CO2e per km)
+_FACTORS = {"car": 0.192, "bus": 0.105, "train": 0.041, "bike": 0.0, "walk": 0.0}
+
+
+def calc_emissions(distance_km: float, mode: str, passengers: int = 1) -> tuple[float, dict]:
+    factor = _FACTORS.get(mode, 0.0)
+    per_passenger = factor / max(passengers, 1)
+    kg = round(distance_km * per_passenger, 3)
+    meta = {"mode": mode, "factor_kg_per_km": round(per_passenger, 6), "kgCO2e": kg, "passengers": passengers, "source": "emissions.py"}
+    return kg, meta
+
+
+# ---------- Error handlers ----------
+@app.errorhandler(ValidationError)
+def on_validation(err: ValidationError):
+    return jsonify({"error": "validation_error", "detail": err.errors()}), 400
+
+
+@app.errorhandler(HTTPException)
+def on_http_exc(err: HTTPException):
+    return jsonify({"error": err.name.replace(' ', '_').lower(), "detail": err.description}), err.code
+
+
+@app.errorhandler(Exception)
+def on_unhandled(err: Exception):
+    app.logger.exception("unhandled_error")
+    return jsonify({"error": "internal_error", "detail": str(err)}), 500
+
+
+# ---------- Helpers ----------
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def get_limit_param(default: int = 20, maximum: int = 100) -> int:
+    try:
+        n = int(request.args.get("limit", default))
+    except Exception:
+        n = default
+    return max(1, min(n, maximum))
+
+
+# ---------- Routes ----------
+@app.route(f"{API_PREFIX}/health", methods=["GET", "HEAD"])
+@app.route("/health", methods=["GET", "HEAD"])
+def health():
+    return jsonify({"status": "ok"})
+
+
+@app.route(f"{API_PREFIX}/db-ping", methods=["GET"])
+@app.route("/db-ping", methods=["GET"])
+def db_ping():
     db.command("ping")
-    return {"db": "ok"}
+    return jsonify({"db": "ok"})
 
-def samples_get_impl():
-    if db is None:
-        return {"error": "db not configured"}, 503
-    limit = request.args.get("limit", "100")
-    try:
-        limit = max(1, min(int(limit), 1000))
-    except ValueError:
-        limit = 100
-    cursor = db.samples.find({}, {"_id": 0}).sort("createdAt", -1).limit(limit)
-    return jsonify([_serialize(d) for d in cursor])
 
-def samples_post_impl():
-    if db is None:
-        return {"error": "db not configured"}, 503
-    raw = request.get_json(silent=True) or {}
-    try:
-        payload = SampleIn.model_validate(raw)
-    except ValidationError as e:
-        return {"error": "validation_error", "detail": e.errors()}, 400
-    doc = payload.model_dump()
-    doc["createdAt"] = datetime.now(timezone.utc)
-    result = db.samples.insert_one(doc)
-    return {"inserted_id": str(result.inserted_id)}, 201
+@app.route(f"{API_PREFIX}/samples", methods=["GET"])
+@app.route("/samples", methods=["GET"])
+def samples_list():
+    limit = get_limit_param()
+    docs = list(db.samples.find({}, {"_id": 0}).sort("createdAt", DESCENDING).limit(limit))
+    return jsonify(docs)
 
-def samples_clear_impl():
-    if db is None:
-        return {"error": "db not configured"}, 503
-    if not str(os.getenv("ALLOW_CLEAR", "")).lower() in ("1", "true", "yes"):
-        return {"error": "forbidden", "detail": "clear endpoints disabled"}, 403
+
+@limiter.limit("20 per minute")
+@app.route(f"{API_PREFIX}/samples", methods=["POST"])
+@app.route("/samples", methods=["POST"])
+def samples_create():
+    auth = require_api_key()
+    if auth:
+        return auth
+    data = SampleIn.model_validate_json(request.data or b"{}")
+    doc = data.model_dump()
+    doc["createdAt"] = now_utc()
+    ins = db.samples.insert_one(doc)
+    return jsonify({"inserted_id": str(ins.inserted_id)}), 201
+
+
+@app.route(f"{API_PREFIX}/samples/clear", methods=["POST"])
+def samples_clear():
+    if not ALLOW_CLEAR:
+        return jsonify({"error": "forbidden", "detail": "clearing disabled"}), 403
+    auth = require_api_key()
+    if auth:
+        return auth
     res = db.samples.delete_many({})
-    return {"deleted": res.deleted_count}
+    return jsonify({"deleted": res.deleted_count})
 
-def commutes_post_impl():
-    if db is None:
-        return {"error": "db not configured"}, 503
-    raw = request.get_json(silent=True) or {}
-    try:
-        trip = CommuteIn.model_validate(raw)
-    except ValidationError as e:
-        return {"error": "validation_error", "detail": e.errors()}, 400
 
-    # Prefer user's emissions.py; fall back to local factors on error/missing
-    if _external_estimate_emissions:
-        try:
-            extras = {k: v for k, v in raw.items() if k not in {"distance_km", "mode", "origin", "destination"}}
-            er = _external_estimate_emissions(trip.distance_km, trip.mode, **extras)
-        except Exception as ex:
-            er = _estimate_emissions_local(trip.distance_km, trip.mode)
-            er["source"] = f"emissions.py failed: {ex}; used local_fallback"
-    else:
-        er = _estimate_emissions_local(trip.distance_km, trip.mode)
-
-    kg = er.get("kgCO2e")
-    if kg is None:
-        kg = er.get("kg_co2e") or er.get("kg") or er.get("co2e_kg") or 0.0
-
+@limiter.limit("20 per minute")
+@app.route(f"{API_PREFIX}/commutes", methods=["POST"])
+def commute_create():
+    auth = require_api_key()
+    if auth:
+        return auth
+    payload = CommuteIn.model_validate_json(request.data or b"{}")
+    kg, meta = calc_emissions(payload.distance_km, payload.mode, payload.passengers)
     doc = {
-        "origin": trip.origin,
-        "destination": trip.destination,
-        "mode": trip.mode,
-        "distance_km": float(trip.distance_km),
-        "emissions_kgCO2e": float(kg),
-        "meta": er,
-        "createdAt": datetime.now(timezone.utc),
+        "createdAt": now_utc(),
+        "distance_km": float(payload.distance_km),
+        "mode": payload.mode,
+        "origin": payload.origin,
+        "destination": payload.destination,
+        "emissions_kgCO2e": kg,
+        "meta": meta,
     }
-    res = db.commutes.insert_one(doc)
-    doc_out = {k: v for k, v in doc.items() if k != "_id"}
-    doc_out["id"] = str(res.inserted_id)
-    return {"ok": True, "data": doc_out}, 201
+    db.commutes.insert_one(doc)
+    # Return without _id for simplicity
+    out = dict(doc)
+    out["createdAt"] = out["createdAt"].isoformat()
+    return jsonify({"data": out}), 201
 
-def commutes_get_impl():
-    if db is None:
-        return {"error": "db not configured"}, 503
-    limit = request.args.get("limit", "50")
-    try:
-        limit = max(1, min(int(limit), 1000))
-    except ValueError:
-        limit = 50
-    cursor = db.commutes.find({}, {"_id": 0}).sort("createdAt", -1).limit(limit)
-    return jsonify([_serialize(d) for d in cursor])
 
-def commutes_clear_impl():
-    if db is None:
-        return {"error": "db not configured"}, 503
-    if not str(os.getenv("ALLOW_CLEAR", "")).lower() in ("1", "true", "yes"):
-        return {"error": "forbidden", "detail": "clear endpoints disabled"}, 403
+@app.route(f"{API_PREFIX}/commutes", methods=["GET"])
+def commute_list():
+    limit = get_limit_param()
+    docs = list(
+        db.commutes.find({}, {"_id": 0})
+        .sort("createdAt", DESCENDING)
+        .limit(limit)
+    )
+    return jsonify(docs)
+
+
+@app.route(f"{API_PREFIX}/commutes/clear", methods=["POST"])
+def commute_clear():
+    if not ALLOW_CLEAR:
+        return jsonify({"error": "forbidden", "detail": "clearing disabled"}), 403
+    auth = require_api_key()
+    if auth:
+        return auth
     res = db.commutes.delete_many({})
-    return {"deleted": res.deleted_count}
+    return jsonify({"deleted": res.deleted_count})
 
-# ----- v1 Blueprint -----
-api = Blueprint("api", __name__, url_prefix="/api/v1")
 
-@api.get("/health")
-def v1_health():
-    return health_impl()
-
-@api.get("/db-ping")
-def v1_db_ping():
-    return db_ping_impl()
-
-@api.get("/samples")
-def v1_samples_get():
-    try:
-        return samples_get_impl()
-    except errors.PyMongoError as e:
-        return {"error": "db read failed", "detail": str(e)}, 500
-
-@api.post("/samples")
-@require_api_key
-@limiter.limit("20/minute")
-def v1_samples_post():
-    try:
-        return samples_post_impl()
-    except errors.PyMongoError as e:
-        return {"error": "db write failed", "detail": str(e)}, 500
-
-@api.post("/samples/clear")
-@require_api_key
-@limiter.limit("5/minute")
-def v1_samples_clear():
-    try:
-        return samples_clear_impl()
-    except errors.PyMongoError as e:
-        return {"error": "db clear failed", "detail": str(e)}, 500
-
-@api.post("/commutes")
-@require_api_key
-@limiter.limit("20/minute")
-def v1_commutes_post():
-    try:
-        return commutes_post_impl()
-    except errors.PyMongoError as e:
-        return {"error": "db write failed", "detail": str(e)}, 500
-
-@api.get("/commutes")
-def v1_commutes_get():
-    try:
-        return commutes_get_impl()
-    except errors.PyMongoError as e:
-        return {"error": "db read failed", "detail": str(e)}, 500
-
-@api.post("/commutes/clear")
-@require_api_key
-@limiter.limit("5/minute")
-def v1_commutes_clear():
-    try:
-        return commutes_clear_impl()
-    except errors.PyMongoError as e:
-        return {"error": "db clear failed", "detail": str(e)}, 500
-
-app.register_blueprint(api)
-
-# ----- Legacy (temporary) -----
-@app.get("/health")
-def legacy_health():
-    return v1_health()
-
-@app.get("/db-ping")
-def legacy_db_ping():
-    return v1_db_ping()
-
-@app.get("/samples")
-def legacy_samples_get():
-    return v1_samples_get()
-
-@app.post("/samples")
-def legacy_samples_post():
-    return v1_samples_post()
-
+# ---------- Logging ----------
 if __name__ == "__main__":
-    app.run(debug=True)
+    logging.basicConfig(level=logging.INFO)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "3000")), debug=False)
