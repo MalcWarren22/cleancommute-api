@@ -1,38 +1,24 @@
-name: deploy-heroku
+name: Deploy to Heroku
+
 on:
   push:
-    branches: ["main"]
-    paths:
-      - "**.py"
-      - "requirements.txt"
-      - "Procfile"
-      - ".github/workflows/deploy-heroku.yml"
-  workflow_dispatch: {}
+    branches: [ "main" ]
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # (optional) Set up Python to lint/compile if you like
+      - uses: actions/setup-python@v5
         with:
-          fetch-depth: 0  # This fetches the full git history
-      
-      # Check Python syntax before deploying
-      - name: Set up Python
-        uses: actions/setup-python@v5
+          python-version: "3.12"
+
+      - name: Deploy
+        uses: akhileshns/heroku-deploy@v3.13.15
         with:
-          python-version: '3.12'
-      
-      - name: Check Python syntax
-        run: |
-          python -m py_compile *.py
-      
-      # Deploy to Heroku via Git
-      - name: Deploy via Git to Heroku
-        env:
-          HEROKU_API_KEY:  ${{ secrets.HEROKU_API_KEY }}
-          HEROKU_APP_NAME: ${{ secrets.HEROKU_APP_NAME }}
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git remote add heroku https://heroku:${HEROKU_API_KEY}@git.heroku.com/${HEROKU_APP_NAME}.git
-          git push heroku HEAD:main -f
+          heroku_api_key: ${{ secrets.HEROKU_API_KEY }}
+          heroku_app_name: ${{ secrets.HEROKU_APP_NAME }}
+          heroku_email: ${{ secrets.HEROKU_EMAIL }}
+          branch: main
