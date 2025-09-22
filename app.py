@@ -1,73 +1,177 @@
 import os
-from flask import Flask, request, current_app, Response
+import json
+from functools import wraps
+from datetime import datetime
+from typing import Any, Dict
+
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from pymongo import MongoClient
+from bson import ObjectId
+from werkzeug.middleware.proxy_fix import ProxyFix
+
 from emissions import estimate_emissions
-from urllib.parse import urlparse
 
 
-def create_app():
+def create_app() -> Flask:
     app = Flask(__name__)
-    CORS(app)
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)  # type: ignore
 
-    # --- MongoDB Setup ---
-    mongo_uri = os.environ.get("MONGO_URI")
-    if not mongo_uri:
-        raise RuntimeError("MONGO_URI is not set")
+    # ---- Config (env-backed) ----
+    app.config["API_KEY"] = os.getenv("API_KEY", "")
+    app.config["MONGO_URI"] = os.getenv("MONGO_URI", "")
+    app.config["MONGO_DB"] = os.getenv("MONGO_DB", "cleancommute")  # default for CI/heroku
+    app.config["DEFAULT_LIMITS"] = os.getenv("DEFAULT_LIMITS", "100 per 15 minutes")
+    app.config["ALLOW_CLEAR"] = os.getenv("ALLOW_CLEAR", "false").lower() == "true"
+    app.config["FRONTEND_ORIGIN"] = os.getenv("FRONTEND_ORIGIN", "")
 
-    mongo_client = MongoClient(mongo_uri)
+    limiter_storage = os.getenv("LIMITER_STORAGE_URI")  # e.g. redis://...
+    CORS(app, resources={r"/api/*": {"origins": app.config["FRONTEND_ORIGIN"]}})
 
-    # Extract DB name from URI (fallback to "cleancommute")
-    parsed = urlparse(mongo_uri)
-    db_name = parsed.path.lstrip("/") or "cleancommute"
-    app.db = mongo_client[db_name]
-
-    # --- Rate Limiting ---
     limiter = Limiter(
-        get_remote_address,
-        app=app,
-        storage_uri=os.environ.get("LIMITER_STORAGE_URI", "memory://"),
-        default_limits=[os.environ.get("DEFAULT_LIMITS", "60 per minute")],
+        key_func=get_remote_address,
+        default_limits=[app.config["DEFAULT_LIMITS"]],
+        storage_uri=limiter_storage if limiter_storage else None,
     )
+    limiter.init_app(app)
 
-    # --- Routes ---
-    @app.route("/api/v1/health")
+    # ---- Mongo ----
+    if not app.config["MONGO_URI"]:
+        raise RuntimeError("MONGO_URI is required")
+    mongo_client = MongoClient(app.config["MONGO_URI"])
+    db = mongo_client[app.config["MONGO_DB"]]
+    samples = db["samples"]
+    commutes = db["commutes"]
+
+    # ---- Helpers ----
+    def sanitize_mongo(obj: Any) -> Any:
+        if isinstance(obj, ObjectId):
+            return str(obj)
+        if isinstance(obj, list):
+            return [sanitize_mongo(x) for x in obj]
+        if isinstance(obj, dict):
+            return {k: sanitize_mongo(v) for k, v in obj.items()}
+        return obj
+
+    def json_ok(payload: Dict[str, Any], status: int = 200):
+        return jsonify(payload), status
+
+    def require_api_key(f):
+        @wraps(f)
+        def wrapper(*args, **kwargs):
+            expected = app.config.get("API_KEY", "")
+            if not expected:  # if no key configured, allow (local/dev)
+                return f(*args, **kwargs)
+            provided = request.headers.get("x-api-key")
+            if not provided or provided != expected:
+                resp, code = json_ok(
+                    {"error": "unauthorized", "detail": "Missing or invalid API key"},
+                    401,
+                )
+                resp.headers["WWW-Authenticate"] = 'API-Key realm="clean-commute-api"'
+                return resp, code
+            return f(*args, **kwargs)
+
+        return wrapper
+
+    # ---- Error handlers ----
+    @app.errorhandler(429)
+    def rate_limit_handler(e):
+        return json_ok({"error": "rate_limited", "detail": str(e)}, 429)
+
+    @app.errorhandler(Exception)
+    def unhandled_error(e):
+        # Keep responses JSON for any unhandled errors
+        return json_ok({"error": "internal_error", "detail": str(e)}, 500)
+
+    # ---- Routes ----
+    @app.get("/api/v1/health")
     def health():
-        """Simple health check with DB name for debugging."""
-        return {"status": "ok", "db": db_name}, 200
+        return json_ok({"ok": True, "ts": datetime.utcnow().isoformat()})
 
-    @app.route("/api/v1/commutes", methods=["POST"])
-    @limiter.limit("10 per minute")
-    def add_commute():
-        """Add a commute record and return emissions estimate."""
-        data = request.json or {}
-        distance = data.get("distance_km", 0)
-        mode = data.get("mode", "car")
-        passengers = data.get("passengers", 1)
+    @app.get("/api/v1/db-ping")
+    def db_ping():
+        try:
+            mongo_client.server_info()
+            return json_ok({"ok": True})
+        except Exception as e:
+            return json_ok({"ok": False, "detail": str(e)}, 500)
 
-        estimate = estimate_emissions(distance, mode, passengers=passengers)
-        app.db.commutes.insert_one({**data, **estimate})
-        return estimate, 201
+    # Samples
+    @app.get("/api/v1/samples")
+    def samples_list():
+        docs = list(samples.find().limit(100))
+        return json_ok({"data": sanitize_mongo(docs)})
 
-    @app.route("/api/v1/commutes", methods=["GET"])
-    def list_commutes():
-        """List all commute records."""
-        commutes = list(app.db.commutes.find({}, {"_id": 0}))
-        return {"commutes": commutes}
+    @app.post("/api/v1/samples")
+    @require_api_key
+    def samples_create():
+        payload = request.get_json(silent=True) or {}
+        doc = {
+            "name": payload.get("name", "sample"),
+            "created_at": datetime.utcnow(),
+            "meta": payload.get("meta", {}),
+        }
+        res = samples.insert_one(doc)
+        doc["_id"] = res.inserted_id
+        return json_ok({"data": sanitize_mongo(doc)}, 201)
 
-    @app.route("/api/v1/commutes/clear", methods=["POST"])
-    def clear_commutes():
-        """Clear all commute records (dev only)."""
-        app.db.commutes.delete_many({})
-        return {"cleared": True}
+    @app.post("/api/v1/samples/clear")
+    @require_api_key
+    def samples_clear():
+        if not app.config["ALLOW_CLEAR"]:
+            return json_ok({"error": "forbidden", "detail": "Clearing disabled"}, 403)
+        n = samples.delete_many({}).deleted_count
+        return json_ok({"deleted": n})
+
+    # Commutes
+    @app.get("/api/v1/commutes")
+    def commute_list():
+        items = list(commutes.find().sort("created_at", -1).limit(100))
+        return json_ok({"data": sanitize_mongo(items)})
+
+    @app.post("/api/v1/commutes")
+    @require_api_key
+    def commute_create():
+        payload = request.get_json(silent=True) or {}
+        distance_km = float(payload.get("distance_km") or 0)  # optional
+        mode = (payload.get("mode") or "car").lower()
+        pax = int(payload.get("passengers", 1))
+        est = None
+        if distance_km > 0:
+            est = estimate_emissions(distance_km, mode, passengers=pax)
+
+        doc = {
+            "origin": payload.get("origin"),
+            "destination": payload.get("destination"),
+            "mode": mode,
+            "notes": payload.get("notes"),
+            "distance_km": distance_km or None,
+            "estimate": est,
+            "created_at": datetime.utcnow(),
+        }
+        res = commutes.insert_one(doc)
+        doc["_id"] = res.inserted_id
+        return json_ok({"data": sanitize_mongo(doc)}, 201)
+
+    @app.post("/api/v1/commutes/clear")
+    @require_api_key
+    def commute_clear():
+        if not app.config["ALLOW_CLEAR"]:
+            return json_ok({"error": "forbidden", "detail": "Clearing disabled"}, 403)
+        n = commutes.delete_many({}).deleted_count
+        return json_ok({"deleted": n})
+
+    @app.get("/")
+    def root():
+        return json_ok({"service": "clean-commute-api", "prefix": "/api/v1"})
 
     return app
 
 
-# Entrypoint for Heroku / gunicorn
 app = create_app()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
