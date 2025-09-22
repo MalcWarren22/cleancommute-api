@@ -4,14 +4,62 @@ from functools import wraps
 from datetime import datetime
 from typing import Any, Dict
 
-from flask import Flask, request, current_app
+from flask import Flask, request, current_app, Response
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from pymongo import MongoClient
 from bson import ObjectId
 from werkzeug.middleware.proxy_fix import ProxyFix
-from werkzeug.exceptions import NotFound
+from pydantic import BaseModel, Field, ValidationError
+
+# --- OpenAPI schema (extend as needed)
+OPENAPI = {
+    "openapi": "3.0.3",
+    "info": {"title": "CleanCommute API", "version": "1.0.0"},
+    "paths": {
+        "/api/v1/health": {
+            "get": {"summary": "Health check", "responses": {"200": {"description": "OK"}}}
+        },
+        "/api/v1/commutes": {
+            "get": {
+                "summary": "List commutes",
+                "parameters": [
+                    {"in": "query", "name": "limit", "schema": {"type": "integer"}},
+                    {"in": "query", "name": "offset", "schema": {"type": "integer"}},
+                ],
+                "responses": {"200": {"description": "OK"}},
+            },
+            "post": {
+                "summary": "Create commute",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "required": ["origin", "destination"],
+                                "properties": {
+                                    "origin": {"type": "string"},
+                                    "destination": {"type": "string"},
+                                    "mode": {
+                                        "type": "string",
+                                        "enum": ["driving", "transit", "bike", "walk"],
+                                    },
+                                    "notes": {"type": "string"},
+                                },
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "201": {"description": "Created"},
+                    "401": {"description": "Unauthorized"},
+                },
+            },
+        },
+    },
+}
 
 
 def create_app() -> Flask:
@@ -25,7 +73,7 @@ def create_app() -> Flask:
     app.config["DEFAULT_LIMITS"] = os.getenv("DEFAULT_LIMITS", "100 per 15 minutes")
     app.config["ALLOW_CLEAR"] = os.getenv("ALLOW_CLEAR", "false").lower() == "true"
     app.config["FRONTEND_ORIGIN"] = os.getenv("FRONTEND_ORIGIN", "")
-    limiter_storage = os.getenv("LIMITER_STORAGE_URI")  # e.g., redis:// or rediss://
+    limiter_storage = os.getenv("LIMITER_STORAGE_URI")
 
     CORS(app, resources={r"/api/*": {"origins": app.config["FRONTEND_ORIGIN"]}})
 
@@ -39,11 +87,19 @@ def create_app() -> Flask:
     if not app.config["MONGO_URI"]:
         raise RuntimeError("MONGO_URI is required")
 
-    # --- Mongo (explicit names; never evaluate a Collection in boolean context)
+    # --- Mongo
     mongo_client = MongoClient(app.config["MONGO_URI"])
     db = mongo_client[app.config["MONGO_DB"]]
     samples_col = db.get_collection("samples")
     commutes_col = db.get_collection("commutes")
+
+    # Indexes
+    try:
+        commutes_col.create_index([("created_at", -1)])
+        commutes_col.create_index([("mode", 1), ("created_at", -1)])
+        samples_col.create_index([("created_at", -1)])
+    except Exception:
+        pass
 
     # --- Helpers
     def sanitize_mongo(obj: Any) -> Any:
@@ -55,15 +111,16 @@ def create_app() -> Flask:
             return {k: sanitize_mongo(v) for k, v in obj.items()}
         return obj
 
-    def json_ok(payload: Dict[str, Any] | list, status: int = 200):
-        body = json.dumps(payload, default=str)
-        return current_app.response_class(body, mimetype="application/json", status=status)
+    def json_ok(payload: Any, status: int = 200):
+        return current_app.response_class(
+            json.dumps(payload, default=str), mimetype="application/json", status=status
+        )
 
     def require_api_key(f):
         @wraps(f)
         def wrapper(*args, **kwargs):
             expected = current_app.config.get("API_KEY", "")
-            if expected == "":  # allow open if not set (local / CI)
+            if expected == "":
                 return f(*args, **kwargs)
             provided = request.headers.get("x-api-key")
             if provided != expected:
@@ -74,22 +131,45 @@ def create_app() -> Flask:
                 resp.headers["WWW-Authenticate"] = 'API-Key realm="clean-commute-api"'
                 return resp
             return f(*args, **kwargs)
+
         return wrapper
 
+    def get_pagination():
+        try:
+            limit = min(max(int(request.args.get("limit", 50)), 1), 200)
+        except ValueError:
+            limit = 50
+        try:
+            offset = max(int(request.args.get("offset", 0)), 0)
+        except ValueError:
+            offset = 0
+        return limit, offset
+
+    # --- Validation models
+    class CommuteIn(BaseModel):
+        origin: str
+        destination: str
+        mode: str = Field(default="driving", pattern="^(driving|transit|bike|walk)$")
+        notes: str | None = None
+
+    class SampleIn(BaseModel):
+        name: str
+        meta: dict = {}
+
     # --- Error handlers
+    @app.errorhandler(404)
+    def not_found(e):
+        return json_ok({"error": "not_found", "detail": str(e)}, 404)
+
     @app.errorhandler(429)
     def rate_limit_handler(e):
         return json_ok({"error": "rate_limited", "detail": str(e)}, 429)
-
-    @app.errorhandler(NotFound)
-    def not_found_handler(e):
-        return json_ok({"error": "not_found", "detail": str(e)}, 404)
 
     @app.errorhandler(Exception)
     def unhandled_error(e):
         return json_ok({"error": "internal_error", "detail": str(e)}, 500)
 
-    # --- Health (both paths)
+    # --- Routes
     @app.get("/api/v1/health")
     def health():
         return json_ok({"ok": True, "ts": datetime.utcnow().isoformat()})
@@ -106,21 +186,23 @@ def create_app() -> Flask:
         except Exception as exc:
             return json_ok({"ok": False, "detail": str(exc)}, 500)
 
-    # --- Samples
     @app.get("/api/v1/samples")
     def samples_list():
-        docs = list(samples_col.find().limit(100))
-        return json_ok({"data": sanitize_mongo(docs)})
+        limit, offset = get_pagination()
+        docs = list(samples_col.find().sort("created_at", -1).skip(offset).limit(limit))
+        has_more = samples_col.count_documents({}) > offset + len(docs)
+        return json_ok(
+            {"data": sanitize_mongo(docs), "next_offset": offset + len(docs), "has_more": has_more}
+        )
 
     @app.post("/api/v1/samples")
     @require_api_key
     def samples_create():
-        payload = request.get_json(silent=True) or {}
-        doc = {
-            "name": payload.get("name", "sample"),
-            "created_at": datetime.utcnow(),
-            "meta": payload.get("meta", {}),
-        }
+        try:
+            payload = SampleIn(**(request.get_json(silent=True) or {})).model_dump()
+        except ValidationError as e:
+            return json_ok({"error": "bad_request", "detail": e.errors()}, 400)
+        doc = {"created_at": datetime.utcnow(), **payload}
         res = samples_col.insert_one(doc)
         doc["_id"] = res.inserted_id
         return json_ok({"data": sanitize_mongo(doc)}, 201)
@@ -133,23 +215,23 @@ def create_app() -> Flask:
         deleted = samples_col.delete_many({}).deleted_count
         return json_ok({"deleted": deleted})
 
-    # --- Commutes
     @app.get("/api/v1/commutes")
     def commute_list():
-        items = list(commutes_col.find().sort("created_at", -1).limit(100))
-        return json_ok({"data": sanitize_mongo(items)})
+        limit, offset = get_pagination()
+        items = list(commutes_col.find().sort("created_at", -1).skip(offset).limit(limit))
+        has_more = commutes_col.count_documents({}) > offset + len(items)
+        return json_ok(
+            {"data": sanitize_mongo(items), "next_offset": offset + len(items), "has_more": has_more}
+        )
 
     @app.post("/api/v1/commutes")
     @require_api_key
     def commute_create():
-        payload = request.get_json(silent=True) or {}
-        doc = {
-            "origin": payload.get("origin"),
-            "destination": payload.get("destination"),
-            "mode": payload.get("mode", "driving"),
-            "notes": payload.get("notes"),
-            "created_at": datetime.utcnow(),
-        }
+        try:
+            payload = CommuteIn(**(request.get_json(silent=True) or {})).model_dump()
+        except ValidationError as e:
+            return json_ok({"error": "bad_request", "detail": e.errors()}, 400)
+        doc = {"created_at": datetime.utcnow(), **payload}
         res = commutes_col.insert_one(doc)
         doc["_id"] = res.inserted_id
         return json_ok({"data": sanitize_mongo(doc)}, 201)
@@ -165,6 +247,24 @@ def create_app() -> Flask:
     @app.get("/")
     def root():
         return json_ok({"service": "clean-commute-api", "prefix": "/api/v1"})
+
+    @app.get("/openapi.json")
+    def openapi():
+        return current_app.response_class(
+            json.dumps(OPENAPI, default=str), mimetype="application/json"
+        )
+
+    @app.get("/docs")
+    def docs():
+        html = """
+<!doctype html><html><head><meta charset="utf-8"><title>CleanCommute API</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/redoc/bundles/redoc.standalone.css">
+</head><body>
+<redoc spec-url='/openapi.json'></redoc>
+<script src="https://cdn.jsdelivr.net/npm/redoc/bundles/redoc.standalone.js"></script>
+</body></html>
+"""
+        return Response(html, mimetype="text/html")
 
     return app
 
