@@ -1,5 +1,4 @@
 name: Deploy to Heroku
-
 on:
   push:
     branches: [ "main" ]
@@ -10,15 +9,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # (optional) Set up Python to lint/compile if you like
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+      # Ensure Heroku CLI exists (prevents "heroku: not found")
+      - name: Install Heroku CLI
+        run: curl https://cli-assets.heroku.com/install-ubuntu.sh | sh
 
-      - name: Deploy
-        uses: akhileshns/heroku-deploy@v3.13.15
-        with:
-          heroku_api_key: ${{ secrets.HEROKU_API_KEY }}
-          heroku_app_name: ${{ secrets.HEROKU_APP_NAME }}
-          heroku_email: ${{ secrets.HEROKU_EMAIL }}
-          branch: main
+      - name: Show Heroku version
+        run: heroku --version
+
+      # Authenticate with API key (no username/password)
+      - name: Auth Heroku
+        env:
+          HEROKU_API_KEY: ${{ secrets.HEROKU_API_KEY }}
+        run: |
+          cat > ~/.netrc <<EOF
+          machine api.heroku.com
+            login _
+            password $HEROKU_API_KEY
+          machine git.heroku.com
+            login _
+            password $HEROKU_API_KEY
+          EOF
+
+      # Push to your existing app (no auto-create)
+      - name: Push to Heroku
+        run: |
+          heroku git:remote -a cleancommute-api-python
+          git push heroku HEAD:main -f
