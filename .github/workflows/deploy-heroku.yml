@@ -1,4 +1,3 @@
-
 name: Deploy to Heroku
 
 on:
@@ -13,10 +12,25 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
       
-    - name: Deploy to Heroku
-      uses: akhileshns/heroku-deploy@v3.13.15
+    - name: Setup Node.js (for Heroku CLI)
+      uses: actions/setup-node@v4
       with:
-        heroku_api_key: ${{ secrets.HEROKU_API_KEY }}
-        heroku_app_name: ${{ secrets.HEROKU_APP_NAME }}
-        heroku_email: ${{ secrets.HEROKU_EMAIL }}
-        usedocker: false
+        node-version: '18'
+        
+    - name: Install Heroku CLI via npm
+      run: npm install -g heroku
+      
+    - name: Login to Heroku
+      env:
+        HEROKU_API_KEY: ${{ secrets.HEROKU_API_KEY }}
+      run: |
+        echo "machine api.heroku.com login ${{ secrets.HEROKU_EMAIL }} password ${{ secrets.HEROKU_API_KEY }}" > ~/.netrc
+        echo "machine git.heroku.com login ${{ secrets.HEROKU_EMAIL }} password ${{ secrets.HEROKU_API_KEY }}" >> ~/.netrc
+        chmod 600 ~/.netrc
+        
+    - name: Add Heroku remote and deploy
+      run: |
+        git config --global user.email "action@github.com"
+        git config --global user.name "GitHub Action"
+        heroku git:remote -a ${{ secrets.HEROKU_APP_NAME }}
+        git push heroku HEAD:main
