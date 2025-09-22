@@ -11,7 +11,7 @@ from flask_limiter.util import get_remote_address
 from pymongo import MongoClient
 from bson import ObjectId
 from werkzeug.middleware.proxy_fix import ProxyFix
-from werkzeug.exceptions import HTTPException  # <-- NEW
+from werkzeug.exceptions import HTTPException
 
 
 def create_app() -> Flask:
@@ -23,17 +23,14 @@ def create_app() -> Flask:
     app.config["MONGO_URI"] = os.getenv("MONGO_URI", "")
     app.config["MONGO_DB"] = os.getenv("MONGO_DB", "cleancommute")
     app.config["DEFAULT_LIMITS"] = os.getenv("DEFAULT_LIMITS", "100 per 15 minutes")
-    app.config["ALLOW_CLEAR"] = os.getenv("ALLOW_CLEAR", "false").strip().lower() in (
+    app.config["ALLOW_CLEAR"] = os.getenv("ALLOW_CLEAR", "false").strip().lower() in {
         "true",
         "1",
         "yes",
         "y",
         "on",
-    )
+    }
     app.config["FRONTEND_ORIGIN"] = os.getenv("FRONTEND_ORIGIN", "")
-
-    if not app.config["MONGO_URI"]:
-        raise RuntimeError("MONGO_URI is required")
 
     # ---------- CORS ----------
     cors_origin = app.config["FRONTEND_ORIGIN"] or "*"
@@ -48,11 +45,23 @@ def create_app() -> Flask:
     )
     limiter.init_app(app)
 
-    # ---------- Mongo ----------
-    mongo_client = MongoClient(app.config["MONGO_URI"])
-    db = mongo_client[app.config["MONGO_DB"]]
-    samples = db["samples"]
-    commutes = db["commutes"]
+    # ---------- Mongo (do not crash app if not configured) ----------
+    mongo_client = None
+    db = None
+    samples = None
+    commutes = None
+    mongo_status = "not_configured"
+    if app.config["MONGO_URI"]:
+        try:
+            mongo_client = MongoClient(app.config["MONGO_URI"], serverSelectionTimeoutMS=5000)
+            mongo_client.server_info()  # trigger connection
+            db = mongo_client[app.config["MONGO_DB"]]
+            samples = db["samples"]
+            commutes = db["commutes"]
+            mongo_status = "connected"
+        except Exception as e:
+            # App still boots; /db-ping will report the error.
+            mongo_status = f"error: {e}"
 
     # ---------- Helpers ----------
     def sanitize_mongo(obj: Any) -> Any:
@@ -92,10 +101,9 @@ def create_app() -> Flask:
             return f(*args, **kwargs)
         return wrapper
 
-    # ---------- Error Handlers (fixed) ----------
+    # ---------- Error Handlers (fix 404s being turned into 500s) ----------
     @app.errorhandler(HTTPException)
     def http_error(e: HTTPException):
-        # Preserve real HTTP codes like 404, 405, etc.
         return json_ok({"error": e.name, "detail": e.description}, e.code)
 
     @app.errorhandler(429)
@@ -104,39 +112,45 @@ def create_app() -> Flask:
 
     @app.errorhandler(Exception)
     def unhandled_error(e):
-        # Only unexpected exceptions become 500
         return json_ok({"error": "internal_error", "detail": str(e)}, 500)
 
-    # ---------- Routes ----------
+    # ---------- Health ----------
     @app.get("/api/v1/health")
     @limiter.exempt
     def health():
-        return json_ok({"ok": True, "ts": datetime.utcnow().isoformat()})
+        return json_ok({"ok": True, "ts": datetime.utcnow().isoformat(), "db": mongo_status})
 
-    # NEW: plain /health for platform checks (returns same 200)
+    # Heroku/GHA friendly root health
     @app.get("/health")
     @limiter.exempt
     def health_alias():
-        return json_ok({"ok": True, "ts": datetime.utcnow().isoformat()})
+        return json_ok({"ok": True, "ts": datetime.utcnow().isoformat(), "db": mongo_status})
 
+    # ---------- DB Ping ----------
     @app.get("/api/v1/db-ping")
     @limiter.exempt
     def db_ping():
+        if not mongo_client:
+            return json_ok({"ok": False, "detail": "MONGO_URI not configured"}, 500)
         try:
-            mongo_client.server_info()  # type: ignore
+            mongo_client.admin.command("ping")
             return json_ok({"ok": True})
         except Exception as e:
             return json_ok({"ok": False, "detail": str(e)}, 500)
 
-    # ----- Samples -----
+    # ---------- Samples ----------
     @app.get("/api/v1/samples")
     def samples_list():
+        if not samples:
+            return json_ok({"data": []})
         docs = list(samples.find().limit(parse_limit()))
         return json_ok({"data": sanitize_mongo(docs)})
 
     @app.post("/api/v1/samples")
     @require_api_key
     def samples_create():
+        if not samples:
+            return json_ok({"error": "unavailable", "detail": "Mongo not configured"}, 503)
         payload = request.get_json(silent=True) or {}
         doc = {
             "name": payload.get("name", "sample"),
@@ -150,20 +164,26 @@ def create_app() -> Flask:
     @app.post("/api/v1/samples/clear")
     @require_api_key
     def samples_clear():
+        if not samples:
+            return json_ok({"error": "unavailable", "detail": "Mongo not configured"}, 503)
         if not current_app.config["ALLOW_CLEAR"]:
             return json_ok({"error": "forbidden", "detail": "Clearing disabled"}, 403)
         n = samples.delete_many({}).deleted_count
         return json_ok({"deleted": n})
 
-    # ----- Commutes -----
+    # ---------- Commutes ----------
     @app.get("/api/v1/commutes")
     def commute_list():
+        if not commutes:
+            return json_ok({"data": []})
         items = list(commutes.find().sort("created_at", -1).limit(parse_limit()))
         return json_ok({"data": sanitize_mongo(items)})
 
     @app.post("/api/v1/commutes")
     @require_api_key
     def commute_create():
+        if not commutes:
+            return json_ok({"error": "unavailable", "detail": "Mongo not configured"}, 503)
         payload = request.get_json(silent=True) or {}
         doc = {
             "origin": payload.get("origin"),
@@ -179,6 +199,8 @@ def create_app() -> Flask:
     @app.post("/api/v1/commutes/clear")
     @require_api_key
     def commute_clear():
+        if not commutes:
+            return json_ok({"error": "unavailable", "detail": "Mongo not configured"}, 503)
         if not current_app.config["ALLOW_CLEAR"]:
             return json_ok({"error": "forbidden", "detail": "Clearing disabled"}, 403)
         n = commutes.delete_many({}).deleted_count
