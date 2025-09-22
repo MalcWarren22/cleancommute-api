@@ -12,8 +12,7 @@ jobs:
     services:
       mongo:
         image: mongo:6
-        ports:
-          - 27017:27017
+        ports: ["27017:27017"]
         options: >-
           --health-cmd="mongosh --quiet --eval 'db.runCommand({ ping: 1 }).ok'"
           --health-interval=5s
@@ -80,24 +79,29 @@ jobs:
               if isinstance(p, dict) and isinstance(p.get("data"), list): return p["data"]
               raise AssertionError(f"Expected list or {{'data': list}}, got: {p!r}")
 
-          r = c.get("/health"); assert r.status_code==200, f"/health -> {r.status_code} {r.data[:120]!r}"
-          r = c.get("/api/v1/health"); assert r.status_code==200, f"/api/v1/health -> {r.status_code} {r.data[:120]!r}"
-          r = c.get("/api/v1/db-ping"); assert r.status_code in (200,500)
+          # Prefer /api/v1/health; fall back to /health if needed
+          r = c.get("/api/v1/health")
+          if r.status_code == 404:
+              r = c.get("/health")
+          b = J(r)
+          assert r.status_code == 200 and b.get("ok") in (True,1), f"/health -> {r.status_code} {b}"
 
-          r = c.get("/api/v1/samples"); _ = as_list(J(r)); assert r.status_code==200
+          r = c.get("/api/v1/db-ping"); _=J(r); assert r.status_code in (200,500)
 
-          r = c.post("/api/v1/samples", json={"name":"CI"}); assert r.status_code==401 and "API-Key" in r.headers.get("WWW-Authenticate","")
+          r = c.get("/api/v1/samples"); samples = as_list(J(r)); assert r.status_code==200 and isinstance(samples, list)
+
+          r = c.post("/api/v1/samples", json={"name":"CI"}); assert r.status_code==401 and r.headers.get("WWW-Authenticate","").startswith("API-Key")
 
           r = c.post("/api/v1/samples", json={"name":"CI"}, headers={"x-api-key": os.environ["API_KEY"]})
-          assert r.status_code in (201,503), f"/samples create -> {r.status_code}"
+          b = J(r); assert r.status_code==201; _id = b["data"]["_id"]; assert isinstance(_id, str) and _id
 
           r = c.post("/api/v1/commutes", json={"origin":"A","destination":"B","mode":"driving"}, headers={"x-api-key": os.environ["API_KEY"]})
-          assert r.status_code in (201,503), f"/commutes create -> {r.status_code}"
+          b = J(r); assert r.status_code==201; _id = b["data"]["_id"]; assert isinstance(_id, str)
 
-          r = c.get("/api/v1/commutes"); assert r.status_code==200
+          r = c.get("/api/v1/commutes"); items = as_list(J(r)); assert r.status_code==200 and isinstance(items, list)
 
-          r = c.post("/api/v1/commutes/clear", headers={"x-api-key": os.environ["API_KEY"]}); assert r.status_code in (200,403,503)
-          r = c.post("/api/v1/samples/clear", headers={"x-api-key": os.environ["API_KEY"]}); assert r.status_code in (200,403,503)
+          r = c.post("/api/v1/commutes/clear", headers={"x-api-key": os.environ["API_KEY"]}); assert r.status_code==200
+          r = c.post("/api/v1/samples/clear",  headers={"x-api-key": os.environ["API_KEY"]}); assert r.status_code==200
           print("✅ Smoke OK")
           PY
 
@@ -109,63 +113,3 @@ jobs:
 
       - name: Vulnerability scan (pip-audit; non-blocking)
         run: pip-audit -r requirements.txt || true
-
-  deploy_staging:
-    name: Deploy to Heroku (staging)
-    runs-on: ubuntu-latest
-    needs: smoke
-    if: github.event_name == 'push' && github.ref == 'refs/heads/staging'
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Heroku CLI
-        uses: akhileshns/heroku-deploy@v3.12.12
-        with:
-          heroku_api_key: ${{ secrets.HEROKU_API_KEY }}
-          heroku_app_name: ${{ vars.HEROKU_APP_STAGING }}
-          heroku_email: ${{ secrets.HEROKU_EMAIL }}
-          usedocker: false
-
-      - name: Health check (staging)
-        run: |
-          set -e
-          URL1="https://${{ vars.HEROKU_APP_STAGING }}.herokuapp.com/health"
-          URL2="https://${{ vars.HEROKU_APP_STAGING }}.herokuapp.com/api/v1/health"
-          echo "Checking $URL1 or $URL2"
-          for i in {1..30}; do
-            code=$(curl -s -o /dev/null -w "%{http_code}" "$URL1") || true
-            [ "$code" = "200" ] && echo "Healthy ✅" && exit 0
-            code=$(curl -s -o /dev/null -w "%{http_code}" "$URL2") || true
-            [ "$code" = "200" ] && echo "Healthy ✅" && exit 0
-            sleep 2
-          done
-          echo "Health check failed ❌"; exit 1
-
-  deploy_prod:
-    name: Deploy to Heroku (production)
-    runs-on: ubuntu-latest
-    needs: smoke
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Heroku CLI
-        uses: akhileshns/heroku-deploy@v3.12.12
-        with:
-          heroku_api_key: ${{ secrets.HEROKU_API_KEY }}
-          heroku_app_name: ${{ vars.HEROKU_APP_PROD }}
-          heroku_email: ${{ secrets.HEROKU_EMAIL }}
-          usedocker: false
-
-      - name: Health check (prod)
-        run: |
-          set -e
-          URL1="https://${{ vars.HEROKU_APP_PROD }}.herokuapp.com/health"
-          URL2="https://${{ vars.HEROKU_APP_PROD }}.herokuapp.com/api/v1/health"
-          echo "Checking $URL1 or $URL2"
-          for i in {1..30}; do
-            code=$(curl -s -o /dev/null -w "%{http_code}" "$URL1") || true
-            [ "$code" = "200" ] && echo "Healthy ✅" && exit 0
-            code=$(curl -s -o /dev/null -w "%{http_code}" "$URL2") || true
-            [ "$code" = "200" ] && echo "Healthy ✅" && exit 0
-            sleep 2
-          done
-          echo "Health check failed ❌"; exit 1
