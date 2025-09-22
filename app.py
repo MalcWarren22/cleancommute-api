@@ -27,7 +27,7 @@ def health():
 
 @app.route("/db-ping")
 def db_ping():
-    if not db:
+    if db is None:
         return {"db": "missing_config"}, 503
     try:
         db.command("ping")
@@ -37,7 +37,7 @@ def db_ping():
 
 @app.route("/samples", methods=["GET"])
 def samples():
-    if not db:
+    if db is None:
         return {"error": "db not configured"}, 503
     try:
         cursor = db.samples.find({}, {"_id": 0}).sort("createdAt", -1)
@@ -47,7 +47,7 @@ def samples():
 
 @app.route("/samples", methods=["POST"])
 def add_sample():
-    if not db:
+    if db is None:
         return {"error": "db not configured"}, 503
     data = request.get_json(silent=True) or {}
     if not isinstance(data, dict):
@@ -61,4 +61,3 @@ def add_sample():
 
 if __name__ == "__main__":
     app.run(debug=True)
-
