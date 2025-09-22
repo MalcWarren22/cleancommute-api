@@ -1,33 +1,39 @@
+# .github/workflows/ci.yml
 name: ci
+
 on:
   push:
     branches: ["**"]
   pull_request:
     branches: ["**"]
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   smoke:
     runs-on: ubuntu-latest
 
-    # Spin up a MongoDB service the app can connect to
+    # Mongo for the tests
     services:
       mongo:
-        image: mongo:6
+        image: mongo:7
         ports: ["27017:27017"]
-        # Wait until Mongo answers ping
         options: >-
-          --health-cmd "mongosh --quiet --eval 'db.adminCommand({ ping: 1 })'"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 20
+          --health-cmd="mongosh --eval 'db.runCommand({ ping: 1 })' || exit 1"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=24
 
     env:
-      # App env for tests (no secrets required)
+      # App env for CI
       MONGO_URI: mongodb://localhost:27017/cleancommute
       API_KEY: ci-test-key-123
       ALLOW_CLEAR: "1"
       FRONTEND_ORIGIN: http://localhost:3000
       DEFAULT_LIMITS: 100 per minute
+      DISABLE_HTTPS_REDIRECT: "1"   # prevent Talisman 302s during tests
 
     steps:
       - uses: actions/checkout@v4
@@ -35,54 +41,89 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: "pip"
 
-      - name: Install deps (+dev tools)
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            pip-${{ runner.os }}-
+
+      - name: Install deps (+ dev tools)
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pytest ruff black pip-audit
+          pip install ruff black pip-audit
 
       - name: Compile sources (fast syntax check)
-        run: python -m py_compile app.py emissions.py
+        run: |
+          python - <<'PY'
+          import subprocess, sys, pathlib
+          files = [p for p in pathlib.Path(".").rglob("*.py")]
+          if files:
+              subprocess.check_call([sys.executable, "-m", "py_compile", *map(str, files)])
+          PY
 
       - name: Wait for Mongo to be reachable
         run: |
           python - <<'PY'
-          import time, os, sys
+          import os, time
           from pymongo import MongoClient
           uri = os.environ["MONGO_URI"]
           for i in range(30):
-            try:
-              MongoClient(uri, serverSelectionTimeoutMS=1000).admin.command("ping")
-              print("Mongo is ready"); sys.exit(0)
-            except Exception as e:
-              print("waiting for mongo...", e); time.sleep(1)
-          sys.exit("Mongo never became ready")
+              try:
+                  MongoClient(uri, serverSelectionTimeoutMS=1000).admin.command("ping")
+                  print("Mongo is up")
+                  break
+              except Exception as e:
+                  print("Waiting for Mongo...", e)
+                  time.sleep(1)
+          else:
+              raise SystemExit("Mongo never became ready")
           PY
 
       - name: Smoke test with Flask test client
         run: |
           python - <<'PY'
-          import os, json
-          from app import app, db
-          client = app.test_client()
-          assert client.get("/api/v1/health").status_code == 200
-          assert client.get("/api/v1/db-ping").status_code == 200
+          import os, json, datetime as dt
+          os.environ.setdefault("DISABLE_HTTPS_REDIRECT","1")
+          # Import app after env is set so it picks up MONGO_URI/etc.
+          from app import app
 
-          # unauthorized -> 401
-          r = client.post("/api/v1/commutes", json={"distance_km":1, "mode":"car"})
-          assert r.status_code == 401, r.data
+          c = app.test_client()
+          def expect(code, resp, msg=""):
+              if resp.status_code != code:
+                  print("Unexpected:", resp.status_code, resp.data.decode())
+                  raise SystemExit(1)
 
-          # authorized create -> 201
-          hdr = {"x-api-key": os.environ["API_KEY"]}
-          r = client.post("/api/v1/commutes", headers=hdr,
-                          json={"distance_km": 2.5, "mode":"car", "origin":"A", "destination":"B"})
-          assert r.status_code == 201, r.data
+          # Basic health / db
+          expect(200, c.get("/api/v1/health"))
+          expect(200, c.get("/api/v1/db-ping"))
 
-          # list -> includes one record
-          r = client.get("/api/v1/commutes?limit=5")
-          assert r.status_code == 200 and len(r.get_json()) >= 1
+          # Unauthorized POSTs should be blocked
+          r = c.post("/api/v1/commutes", json={"distance_km": 1, "mode": "car"})
+          assert r.status_code == 401, r.status_code
+
+          headers = {"x-api-key": os.environ["API_KEY"]}
+
+          # Happy path: create commute
+          r = c.post("/api/v1/commutes", headers=headers,
+                     json={"distance_km": 2.5, "mode": "car", "origin": "CI", "destination": "Check"})
+          expect(201, r)
+
+          # List should include the new record
+          r = c.get("/api/v1/commutes?limit=1")
+          expect(200, r)
+          data = r.get_json()
+          assert isinstance(data, list) and len(data) >= 1
+
+          # Samples create + list
+          r = c.post("/api/v1/samples", headers=headers, json={"name":"CI","status":"ok"})
+          expect(201, r)
+          r = c.get("/api/v1/samples?limit=1")
+          expect(200, r)
+
           print("SMOKE OK")
           PY
 
@@ -91,6 +132,5 @@ jobs:
           ruff check .
           black --check .
 
-      - name: Vulnerability scan (advisory)
-        continue-on-error: true    # don’t fail the build on advisories yet
-        run: pip-audit -r requirements.txt
+      - name: Vulnerability scan (pip-audit; non-blocking)
+        run: pip-audit -r requirements.txt || true
