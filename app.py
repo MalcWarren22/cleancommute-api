@@ -2,7 +2,7 @@ import os
 import json
 from functools import wraps
 from datetime import datetime
-from typing import Any, Dict, List, Union
+from typing import Any, Dict
 
 from flask import Flask, jsonify, request, current_app
 from flask_cors import CORS
@@ -12,14 +12,10 @@ from pymongo import MongoClient
 from bson import ObjectId
 from werkzeug.middleware.proxy_fix import ProxyFix
 
-# ---------- App & Config ----------
 def create_app() -> Flask:
     app = Flask(__name__)
-
-    # Security / HTTPS behind proxies (Heroku)
     app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)  # type: ignore
 
-    # Env
     app.config["API_KEY"] = os.getenv("API_KEY", "")
     app.config["MONGO_URI"] = os.getenv("MONGO_URI", "")
     app.config["MONGO_DB"] = os.getenv("MONGO_DB", "cleancommute")
@@ -28,11 +24,8 @@ def create_app() -> Flask:
     app.config["FRONTEND_ORIGIN"] = os.getenv("FRONTEND_ORIGIN", "")
     limiter_storage = os.getenv("LIMITER_STORAGE_URI")  # e.g., redis://...
 
-    # CORS (single origin)
-    cors_kwargs = {"resources": {r"/api/*": {"origins": app.config["FRONTEND_ORIGIN"]}}}
-    CORS(app, **cors_kwargs)
+    CORS(app, resources={r"/api/*": {"origins": app.config["FRONTEND_ORIGIN"]}})
 
-    # Rate Limiter
     limiter = Limiter(
         key_func=get_remote_address,
         default_limits=[app.config["DEFAULT_LIMITS"]],
@@ -40,7 +33,6 @@ def create_app() -> Flask:
     )
     limiter.init_app(app)
 
-    # Mongo
     if not app.config["MONGO_URI"]:
         raise RuntimeError("MONGO_URI is required")
     mongo_client = MongoClient(app.config["MONGO_URI"])
@@ -48,9 +40,7 @@ def create_app() -> Flask:
     samples = db["samples"]
     commutes = db["commutes"]
 
-    # ---------- Helpers ----------
     def sanitize_mongo(obj: Any) -> Any:
-        """Recursively convert Mongo/ BSON types (ObjectId, etc.) to JSON-safe values."""
         if isinstance(obj, ObjectId):
             return str(obj)
         if isinstance(obj, list):
@@ -60,31 +50,36 @@ def create_app() -> Flask:
         return obj
 
     def json_ok(payload: Dict[str, Any], status: int = 200):
-        # Use Flask's response class with json.dumps to leverage default=str if needed
         body = json.dumps(payload, default=str)
         return current_app.response_class(body, mimetype="application/json", status=status)
 
+    # --- FIXED: 401 instead of 403 when API key missing/invalid ---
     def require_api_key(f):
         @wraps(f)
         def wrapper(*args, **kwargs):
             expected = current_app.config.get("API_KEY", "")
-            provided = request.headers.get("x-api-key", "")
-            if expected and provided != expected:
-                return json_ok({"error": "forbidden", "detail": "Invalid API key"}, 403)
+            if not expected:  # allow in dev if no key configured
+                return f(*args, **kwargs)
+            provided = request.headers.get("x-api-key")
+            if not provided or provided != expected:
+                resp = json_ok(
+                    {"error": "unauthorized", "detail": "Missing or invalid API key"},
+                    401,
+                )
+                resp.headers["WWW-Authenticate"] = 'API-Key realm="clean-commute-api"'
+                return resp
             return f(*args, **kwargs)
         return wrapper
+    # --------------------------------------------------------------
 
-    # ---------- Error Handlers ----------
     @app.errorhandler(429)
     def rate_limit_handler(e):
         return json_ok({"error": "rate_limited", "detail": str(e)}, 429)
 
     @app.errorhandler(Exception)
     def unhandled_error(e):
-        # Avoid leaking stack traces; keep it consistent for smoke tests
         return json_ok({"error": "internal_error", "detail": str(e)}, 500)
 
-    # ---------- Routes ----------
     @app.get("/api/v1/health")
     def health():
         return json_ok({"ok": True, "ts": datetime.utcnow().isoformat()})
@@ -92,13 +87,11 @@ def create_app() -> Flask:
     @app.get("/api/v1/db-ping")
     def db_ping():
         try:
-            # cheap ping by asking server_info (doesn't create a cursor)
             mongo_client.server_info()  # type: ignore
             return json_ok({"ok": True})
         except Exception as e:
             return json_ok({"ok": False, "detail": str(e)}, 500)
 
-    # ----- Samples -----
     @app.get("/api/v1/samples")
     def samples_list():
         docs = list(samples.find().limit(100))
@@ -125,7 +118,6 @@ def create_app() -> Flask:
         n = samples.delete_many({}).deleted_count
         return json_ok({"deleted": n})
 
-    # ----- Commutes -----
     @app.get("/api/v1/commutes")
     def commute_list():
         items = list(commutes.find().sort("created_at", -1).limit(100))
@@ -135,7 +127,6 @@ def create_app() -> Flask:
     @require_api_key
     def commute_create():
         payload = request.get_json(silent=True) or {}
-        # Minimal schema—extend as your model grows
         doc = {
             "origin": payload.get("origin"),
             "destination": payload.get("destination"),
@@ -145,7 +136,6 @@ def create_app() -> Flask:
         }
         res = commutes.insert_one(doc)
         doc["_id"] = res.inserted_id
-        # Sanitize BEFORE returning so ObjectId never hits Flask JSON encoder
         return json_ok({"data": sanitize_mongo(doc)}, 201)
 
     @app.post("/api/v1/commutes/clear")
@@ -156,13 +146,11 @@ def create_app() -> Flask:
         n = commutes.delete_many({}).deleted_count
         return json_ok({"deleted": n})
 
-    # Root
     @app.get("/")
     def root():
         return json_ok({"service": "clean-commute-api", "prefix": "/api/v1"})
 
     return app
-
 
 app = create_app()
 
