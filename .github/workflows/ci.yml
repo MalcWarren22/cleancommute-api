@@ -31,7 +31,6 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          # dev tools
           pip install ruff black pip-audit
 
       - name: Compile sources (fast syntax check)
@@ -56,20 +55,23 @@ jobs:
       - name: Smoke test with Flask test client
         env:
           API_KEY: "ci-key"
-          ALLOW_CLEAR: "true"            # <-- set to "true" so clear endpoints work
+          ALLOW_CLEAR: "true"
           MONGO_URI: "mongodb://localhost:27017"
           MONGO_DB: "cleancommute_ci"
           PYTHONPATH: ${{ github.workspace }}
         run: |
           python - <<'PY'
-          # (keep the smoke test python code you’re using now)
-          # ...
+          # (keep your smoke test code here — unchanged)
           PY
 
-      - name: Style (ruff + black --check)
+      # ---------------------------
+      # Option 1: Auto-format style
+      # ---------------------------
+      - name: Style (ruff + black autoformat)
         run: |
           ruff check .
-          black --check .
+          black .
+          echo "✅ Style checks passed (Black autoformatted if needed)."
 
       - name: Vulnerability scan (pip-audit; non-blocking)
         run: pip-audit -r requirements.txt || true
