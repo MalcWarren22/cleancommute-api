@@ -8,7 +8,10 @@ from pydantic import BaseModel, Field, ValidationError
 from typing import Optional
 from werkzeug.middleware.proxy_fix import ProxyFix
 from flask_talisman import Talisman
-import logging, sys, os
+from functools import wraps
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+import hmac, logging, sys, os
 
 # ----- Setup / DB -----
 load_dotenv(".env")
@@ -18,7 +21,7 @@ db = client["cleancommute"] if client else None
 
 app = Flask(__name__)
 
-# Trust Heroku's reverse proxy (so X-Forwarded-Proto is honored)
+# Trust Heroku's reverse proxy (honor X-Forwarded-Proto)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
 
 # CORS: allow only origins from env var (comma-separated). Use "*" in dev if needed.
@@ -26,7 +29,7 @@ origins_env = os.getenv("ALLOWED_ORIGINS", "*")
 allowed_origins = [o.strip() for o in origins_env.split(",")] if origins_env else ["*"]
 CORS(app, resources={r"/api/*": {"origins": allowed_origins}}, supports_credentials=False)
 
-# HTTPS/HSTS headers + http→https redirect (can disable with ENABLE_HTTPS_HEADERS=0)
+# HTTPS/HSTS headers + http→https redirect (disable with ENABLE_HTTPS_HEADERS=0)
 if os.getenv("ENABLE_HTTPS_HEADERS", "1").lower() not in ("0", "false", "no"):
     Talisman(
         app,
@@ -37,6 +40,11 @@ if os.getenv("ENABLE_HTTPS_HEADERS", "1").lower() not in ("0", "false", "no"):
         content_security_policy=None,  # API-only; no CSP needed
     )
 
+# Rate limiting storage: Redis in prod; memory fallback for local/dev
+storage_uri = os.getenv("REDIS_URL", "memory://")
+limiter = Limiter(key_func=get_remote_address, storage_uri=storage_uri)
+limiter.init_app(app)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
@@ -46,9 +54,21 @@ log = logging.getLogger(__name__)
 
 # Try to use user's emissions.py if present
 try:
-    from emissions import estimate_emissions as _external_estimate_emissions  # (distance_km: float, mode: str) -> dict
+    from emissions import estimate_emissions as _external_estimate_emissions  # (distance_km, mode, **extras) -> dict
 except Exception:
     _external_estimate_emissions = None
+
+# ----- Security: API key (supports rotation via API_KEY + API_KEY_OLD) -----
+API_KEYS = [k for k in (os.getenv("API_KEY", ""), os.getenv("API_KEY_OLD", "")) if k]
+
+def require_api_key(fn):
+    @wraps(fn)
+    def _wrap(*args, **kwargs):
+        sent = request.headers.get("x-api-key", "")
+        if not API_KEYS or not any(hmac.compare_digest(sent, k) for k in API_KEYS):
+            return {"error": "unauthorized"}, 401
+        return fn(*args, **kwargs)
+    return _wrap
 
 # ----- Helpers -----
 def _serialize(doc):
@@ -160,9 +180,11 @@ def commutes_post_impl():
     except ValidationError as e:
         return {"error": "validation_error", "detail": e.errors()}, 400
 
+    # Prefer user's emissions.py; fall back to local factors on error/missing
     if _external_estimate_emissions:
         try:
-            er = _external_estimate_emissions(trip.distance_km, trip.mode, **{k: v for k, v in raw.items() if k not in {"distance_km", "mode"}})
+            extras = {k: v for k, v in raw.items() if k not in {"distance_km", "mode", "origin", "destination"}}
+            er = _external_estimate_emissions(trip.distance_km, trip.mode, **extras)
         except Exception as ex:
             er = _estimate_emissions_local(trip.distance_km, trip.mode)
             er["source"] = f"emissions.py failed: {ex}; used local_fallback"
@@ -225,6 +247,8 @@ def v1_samples_get():
         return {"error": "db read failed", "detail": str(e)}, 500
 
 @api.post("/samples")
+@limiter.limit("20/minute")
+@require_api_key
 def v1_samples_post():
     try:
         return samples_post_impl()
@@ -232,6 +256,8 @@ def v1_samples_post():
         return {"error": "db write failed", "detail": str(e)}, 500
 
 @api.post("/samples/clear")
+@limiter.limit("5/minute")
+@require_api_key
 def v1_samples_clear():
     try:
         return samples_clear_impl()
@@ -239,6 +265,8 @@ def v1_samples_clear():
         return {"error": "db clear failed", "detail": str(e)}, 500
 
 @api.post("/commutes")
+@limiter.limit("20/minute")
+@require_api_key
 def v1_commutes_post():
     try:
         return commutes_post_impl()
@@ -253,6 +281,8 @@ def v1_commutes_get():
         return {"error": "db read failed", "detail": str(e)}, 500
 
 @api.post("/commutes/clear")
+@limiter.limit("5/minute")
+@require_api_key
 def v1_commutes_clear():
     try:
         return commutes_clear_impl()
