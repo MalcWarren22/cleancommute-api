@@ -20,7 +20,7 @@ def health():
     return {"status": "ok"}
 
 @app.route("/db-ping")
-def db_ping():a
+def db_ping():
     try:
         db.command("ping")
         return {"db": "ok"}
