@@ -8,15 +8,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0     # ← full history (not shallow)
 
-      # Ensure Heroku CLI exists (prevents "heroku: not found")
       - name: Install Heroku CLI
         run: curl https://cli-assets.heroku.com/install-ubuntu.sh | sh
 
       - name: Show Heroku version
         run: heroku --version
 
-      # Authenticate with API key (no username/password)
       - name: Auth Heroku
         env:
           HEROKU_API_KEY: ${{ secrets.HEROKU_API_KEY }}
@@ -30,8 +30,15 @@ jobs:
             password $HEROKU_API_KEY
           EOF
 
-      # Push to your existing app (no auto-create)
+      - name: Ensure not shallow (belt & suspenders)
+        run: |
+          if git rev-parse --is-shallow-repository | grep -q true; then
+            git fetch --unshallow --tags
+          else
+            git fetch --tags
+          fi
+
       - name: Push to Heroku
         run: |
           heroku git:remote -a cleancommute-api-python
-          git push heroku HEAD:main -f
+          git push heroku HEAD:main
