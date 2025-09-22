@@ -4,13 +4,14 @@ from functools import wraps
 from datetime import datetime
 from typing import Any, Dict
 
-from flask import Flask, jsonify, request, current_app
+from flask import Flask, request, current_app
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from pymongo import MongoClient
 from bson import ObjectId
 from werkzeug.middleware.proxy_fix import ProxyFix
+from werkzeug.exceptions import NotFound
 
 
 def create_app() -> Flask:
@@ -38,7 +39,7 @@ def create_app() -> Flask:
     if not app.config["MONGO_URI"]:
         raise RuntimeError("MONGO_URI is required")
 
-    # --- Mongo (use explicit *_col names; NEVER check a Collection in boolean context)
+    # --- Mongo (explicit names; never evaluate a Collection in boolean context)
     mongo_client = MongoClient(app.config["MONGO_URI"])
     db = mongo_client[app.config["MONGO_DB"]]
     samples_col = db.get_collection("samples")
@@ -55,16 +56,14 @@ def create_app() -> Flask:
         return obj
 
     def json_ok(payload: Dict[str, Any] | list, status: int = 200):
-        # allow dict OR list; always serialize with default=str for datetimes
         body = json.dumps(payload, default=str)
         return current_app.response_class(body, mimetype="application/json", status=status)
 
-    # 401 for missing/invalid API key
     def require_api_key(f):
         @wraps(f)
         def wrapper(*args, **kwargs):
             expected = current_app.config.get("API_KEY", "")
-            if expected == "":  # allow open if no key configured (local/dev)
+            if expected == "":  # allow open if not set (local / CI)
                 return f(*args, **kwargs)
             provided = request.headers.get("x-api-key")
             if provided != expected:
@@ -75,7 +74,6 @@ def create_app() -> Flask:
                 resp.headers["WWW-Authenticate"] = 'API-Key realm="clean-commute-api"'
                 return resp
             return f(*args, **kwargs)
-
         return wrapper
 
     # --- Error handlers
@@ -83,14 +81,21 @@ def create_app() -> Flask:
     def rate_limit_handler(e):
         return json_ok({"error": "rate_limited", "detail": str(e)}, 429)
 
+    @app.errorhandler(NotFound)
+    def not_found_handler(e):
+        return json_ok({"error": "not_found", "detail": str(e)}, 404)
+
     @app.errorhandler(Exception)
     def unhandled_error(e):
-        # Keep the message but avoid leaking huge tracebacks
         return json_ok({"error": "internal_error", "detail": str(e)}, 500)
 
-    # --- Routes
+    # --- Health (both paths)
     @app.get("/api/v1/health")
     def health():
+        return json_ok({"ok": True, "ts": datetime.utcnow().isoformat()})
+
+    @app.get("/health")
+    def health_alias():
         return json_ok({"ok": True, "ts": datetime.utcnow().isoformat()})
 
     @app.get("/api/v1/db-ping")
@@ -101,10 +106,9 @@ def create_app() -> Flask:
         except Exception as exc:
             return json_ok({"ok": False, "detail": str(exc)}, 500)
 
-    # Samples
+    # --- Samples
     @app.get("/api/v1/samples")
     def samples_list():
-        # IMPORTANT: do not evaluate truthiness of a Collection
         docs = list(samples_col.find().limit(100))
         return json_ok({"data": sanitize_mongo(docs)})
 
@@ -129,7 +133,7 @@ def create_app() -> Flask:
         deleted = samples_col.delete_many({}).deleted_count
         return json_ok({"deleted": deleted})
 
-    # Commutes
+    # --- Commutes
     @app.get("/api/v1/commutes")
     def commute_list():
         items = list(commutes_col.find().sort("created_at", -1).limit(100))
