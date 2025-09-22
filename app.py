@@ -11,6 +11,7 @@ from flask_limiter.util import get_remote_address
 from pymongo import MongoClient
 from bson import ObjectId
 from werkzeug.middleware.proxy_fix import ProxyFix
+from werkzeug.exceptions import HTTPException  # <-- NEW
 
 
 def create_app() -> Flask:
@@ -22,7 +23,6 @@ def create_app() -> Flask:
     app.config["MONGO_URI"] = os.getenv("MONGO_URI", "")
     app.config["MONGO_DB"] = os.getenv("MONGO_DB", "cleancommute")
     app.config["DEFAULT_LIMITS"] = os.getenv("DEFAULT_LIMITS", "100 per 15 minutes")
-    # Accept common truthy values
     app.config["ALLOW_CLEAR"] = os.getenv("ALLOW_CLEAR", "false").strip().lower() in (
         "true",
         "1",
@@ -92,19 +92,31 @@ def create_app() -> Flask:
             return f(*args, **kwargs)
         return wrapper
 
-    # ---------- Error Handlers ----------
+    # ---------- Error Handlers (fixed) ----------
+    @app.errorhandler(HTTPException)
+    def http_error(e: HTTPException):
+        # Preserve real HTTP codes like 404, 405, etc.
+        return json_ok({"error": e.name, "detail": e.description}, e.code)
+
     @app.errorhandler(429)
     def rate_limit_handler(e):
         return json_ok({"error": "rate_limited", "detail": str(e)}, 429)
 
     @app.errorhandler(Exception)
     def unhandled_error(e):
+        # Only unexpected exceptions become 500
         return json_ok({"error": "internal_error", "detail": str(e)}, 500)
 
     # ---------- Routes ----------
     @app.get("/api/v1/health")
     @limiter.exempt
     def health():
+        return json_ok({"ok": True, "ts": datetime.utcnow().isoformat()})
+
+    # NEW: plain /health for platform checks (returns same 200)
+    @app.get("/health")
+    @limiter.exempt
+    def health_alias():
         return json_ok({"ok": True, "ts": datetime.utcnow().isoformat()})
 
     @app.get("/api/v1/db-ping")
