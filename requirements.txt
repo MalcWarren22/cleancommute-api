@@ -7,3 +7,4 @@ pydantic
 itsdangerous
 flask-talisman
 flask-limiter
+redis
