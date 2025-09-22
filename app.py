@@ -6,16 +6,36 @@ from datetime import datetime, timezone
 from werkzeug.exceptions import HTTPException
 from pydantic import BaseModel, Field, ValidationError
 from typing import Optional
+from werkzeug.middleware.proxy_fix import ProxyFix
+from flask_talisman import Talisman
 import logging, sys, os
 
-# ----- Setup -----
+# ----- Setup / DB -----
 load_dotenv(".env")
 MONGO_URI = os.getenv("MONGO_URI")
 client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000, retryWrites=True) if MONGO_URI else None
 db = client["cleancommute"] if client else None
 
 app = Flask(__name__)
-CORS(app)
+
+# Trust Heroku's reverse proxy (so X-Forwarded-Proto is honored)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
+
+# CORS: allow only origins from env var (comma-separated). Use "*" in dev if needed.
+origins_env = os.getenv("ALLOWED_ORIGINS", "*")
+allowed_origins = [o.strip() for o in origins_env.split(",")] if origins_env else ["*"]
+CORS(app, resources={r"/api/*": {"origins": allowed_origins}}, supports_credentials=False)
+
+# HTTPS/HSTS headers + http→https redirect (can disable with ENABLE_HTTPS_HEADERS=0)
+if os.getenv("ENABLE_HTTPS_HEADERS", "1").lower() not in ("0", "false", "no"):
+    Talisman(
+        app,
+        force_https=True,
+        strict_transport_security=True,
+        strict_transport_security_preload=True,
+        strict_transport_security_max_age=31536000,  # 1 year
+        content_security_policy=None,  # API-only; no CSP needed
+    )
 
 logging.basicConfig(
     level=logging.INFO,
@@ -26,7 +46,7 @@ log = logging.getLogger(__name__)
 
 # Try to use user's emissions.py if present
 try:
-    from emissions import estimate_emissions as _external_estimate_emissions  # (distance_km: float, mode: str) -> dict with 'kgCO2e'
+    from emissions import estimate_emissions as _external_estimate_emissions  # (distance_km: float, mode: str) -> dict
 except Exception:
     _external_estimate_emissions = None
 
@@ -41,7 +61,6 @@ def _serialize(doc):
     return out
 
 def _estimate_emissions_local(distance_km: float, mode: str) -> dict:
-    # super simple factors; replace when your real model is ready
     EF = {
         "car": 0.192,
         "car_gas": 0.192,
@@ -90,7 +109,7 @@ class CommuteIn(BaseModel):
     origin: Optional[str] = None
     destination: Optional[str] = None
 
-# ----- Core impls (shared by v1 + legacy) -----
+# ----- Core impls (shared) -----
 def health_impl():
     return {"status": "ok"}
 
@@ -143,7 +162,7 @@ def commutes_post_impl():
 
     if _external_estimate_emissions:
         try:
-            er = _external_estimate_emissions(trip.distance_km, trip.mode)
+            er = _external_estimate_emissions(trip.distance_km, trip.mode, **{k: v for k, v in raw.items() if k not in {"distance_km", "mode"}})
         except Exception as ex:
             er = _estimate_emissions_local(trip.distance_km, trip.mode)
             er["source"] = f"emissions.py failed: {ex}; used local_fallback"
