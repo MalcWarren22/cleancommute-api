@@ -13,8 +13,9 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from flask_talisman import Talisman
 from pydantic import BaseModel, Field, ValidationError
-from pymongo import MongoClient, ASCENDING, DESCENDING
+from pymongo import MongoClient, DESCENDING
 from werkzeug.exceptions import HTTPException
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 # ---------- Config / env ----------
 API_PREFIX = "/api/v1"
@@ -27,28 +28,34 @@ FRONTEND_ORIGIN = os.environ.get("FRONTEND_ORIGIN", "http://localhost:3000")
 ALLOWED_ORIGINS = [FRONTEND_ORIGIN]
 
 LIMITER_STORAGE_URI = os.environ.get("LIMITER_STORAGE_URI")  # e.g. rediss://...
-LIMITER_INSECURE_SSL = os.environ.get("LIMITER_INSECURE_SSL", "0") == "1"  # only if your Redis TLS chain is funky
+LIMITER_INSECURE_SSL = os.environ.get("LIMITER_INSECURE_SSL", "0") == "1"  # allow weak TLS only if needed
 DEFAULT_LIMITS = os.environ.get("DEFAULT_LIMITS", "200 per hour;50 per minute")
+
+# For CI/local tests: disable HTTPS redirect/HSTS from Talisman
+DISABLE_HTTPS_REDIRECT = os.environ.get("DISABLE_HTTPS_REDIRECT", "0") in {"1", "true", "True"}
 
 # ---------- App ----------
 app = Flask(__name__)
 app.json.sort_keys = False
 
-# Security headers + HTTPS redirect on Heroku
+# Honor X-Forwarded-* from Heroku so Flask knows the real scheme/host
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+
+# Security headers + HTTPS redirect (off when DISABLE_HTTPS_REDIRECT=1)
 Talisman(
     app,
-    force_https=True,
-    strict_transport_security=True,
-    content_security_policy=None,  # no CSP for JSON API
+    force_https=not DISABLE_HTTPS_REDIRECT,
+    strict_transport_security=not DISABLE_HTTPS_REDIRECT,
+    content_security_policy=None,  # JSON API only
 )
 
-# CORS (echo only if origin matches our allowlist)
+# CORS (echo only if Origin matches our allowlist)
 CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}}, supports_credentials=False, max_age=3600)
 
 # Rate limiting (Redis if configured, else in-memory)
 storage_options = {}
 if LIMITER_STORAGE_URI and LIMITER_STORAGE_URI.startswith("rediss://") and LIMITER_INSECURE_SSL:
-    # Heroku Redis sometimes sits behind a TLS proxy with a self-signed link in the chain.
+    # Some managed Redis instances present a self-signed link in chain
     storage_options["ssl_cert_reqs"] = ssl.CERT_NONE  # noqa: S501
 
 limiter = Limiter(
@@ -66,7 +73,6 @@ if not MONGO_URI:
 
 mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
 db = mongo_client["cleancommute"]
-assert db is not None
 
 # Helpful indexes (idempotent)
 db.samples.create_index([("createdAt", DESCENDING)])
@@ -74,9 +80,13 @@ db.commutes.create_index([("createdAt", DESCENDING)])
 
 # ---------- Auth ----------
 def require_api_key() -> Optional[tuple[dict, int]]:
+    """
+    If API_KEY is set, require X-API-Key header to match. If API_KEY is empty,
+    allow all (useful for local dev).
+    """
     if not API_KEY:
-        return None  # no API key set -> allow (dev mode)
-    supplied = request.headers.get("x-api-key")
+        return None
+    supplied = request.headers.get("x-api-key") or request.headers.get("X-API-Key")
     if supplied != API_KEY:
         return jsonify({"error": "unauthorized", "detail": "invalid or missing API key"}), 401
     return None
@@ -96,8 +106,7 @@ class CommuteIn(BaseModel):
     passengers: int = Field(default=1, ge=1)
 
 
-# ---------- Emissions ----------
-# Fallback simple factors (kg CO2e per km)
+# ---------- Emissions (fallback simple factors) ----------
 _FACTORS = {"car": 0.192, "bus": 0.105, "train": 0.041, "bike": 0.0, "walk": 0.0}
 
 
@@ -105,7 +114,13 @@ def calc_emissions(distance_km: float, mode: str, passengers: int = 1) -> tuple[
     factor = _FACTORS.get(mode, 0.0)
     per_passenger = factor / max(passengers, 1)
     kg = round(distance_km * per_passenger, 3)
-    meta = {"mode": mode, "factor_kg_per_km": round(per_passenger, 6), "kgCO2e": kg, "passengers": passengers, "source": "emissions.py"}
+    meta = {
+        "mode": mode,
+        "factor_kg_per_km": round(per_passenger, 6),
+        "kgCO2e": kg,
+        "passengers": passengers,
+        "source": "emissions.py",
+    }
     return kg, meta
 
 
@@ -117,7 +132,7 @@ def on_validation(err: ValidationError):
 
 @app.errorhandler(HTTPException)
 def on_http_exc(err: HTTPException):
-    return jsonify({"error": err.name.replace(' ', '_').lower(), "detail": err.description}), err.code
+    return jsonify({"error": err.name.replace(" ", "_").lower(), "detail": err.description}), err.code
 
 
 @app.errorhandler(Exception)
@@ -204,7 +219,6 @@ def commute_create():
         "meta": meta,
     }
     db.commutes.insert_one(doc)
-    # Return without _id for simplicity
     out = dict(doc)
     out["createdAt"] = out["createdAt"].isoformat()
     return jsonify({"data": out}), 201
@@ -214,9 +228,7 @@ def commute_create():
 def commute_list():
     limit = get_limit_param()
     docs = list(
-        db.commutes.find({}, {"_id": 0})
-        .sort("createdAt", DESCENDING)
-        .limit(limit)
+        db.commutes.find({}, {"_id": 0}).sort("createdAt", DESCENDING).limit(limit)
     )
     return jsonify(docs)
 
@@ -232,7 +244,7 @@ def commute_clear():
     return jsonify({"deleted": res.deleted_count})
 
 
-# ---------- Logging ----------
+# ---------- Entrypoint ----------
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "3000")), debug=False)
