@@ -15,7 +15,6 @@ from flask_talisman import Talisman
 from pydantic import BaseModel, Field, ValidationError
 from pymongo import MongoClient, DESCENDING
 from werkzeug.exceptions import HTTPException
-from werkzeug.middleware.proxy_fix import ProxyFix
 
 # ---------- Config / env ----------
 API_PREFIX = "/api/v1"
@@ -28,34 +27,28 @@ FRONTEND_ORIGIN = os.environ.get("FRONTEND_ORIGIN", "http://localhost:3000")
 ALLOWED_ORIGINS = [FRONTEND_ORIGIN]
 
 LIMITER_STORAGE_URI = os.environ.get("LIMITER_STORAGE_URI")  # e.g. rediss://...
-LIMITER_INSECURE_SSL = os.environ.get("LIMITER_INSECURE_SSL", "0") == "1"  # allow weak TLS only if needed
+LIMITER_INSECURE_SSL = os.environ.get("LIMITER_INSECURE_SSL", "0") == "1"
 DEFAULT_LIMITS = os.environ.get("DEFAULT_LIMITS", "200 per hour;50 per minute")
-
-# For CI/local tests: disable HTTPS redirect/HSTS from Talisman
-DISABLE_HTTPS_REDIRECT = os.environ.get("DISABLE_HTTPS_REDIRECT", "0") in {"1", "true", "True"}
 
 # ---------- App ----------
 app = Flask(__name__)
 app.json.sort_keys = False
 
-# Honor X-Forwarded-* from Heroku so Flask knows the real scheme/host
-app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
-
-# Security headers + HTTPS redirect (off when DISABLE_HTTPS_REDIRECT=1)
+# Security headers + HTTPS redirect (Heroku)
 Talisman(
     app,
-    force_https=not DISABLE_HTTPS_REDIRECT,
-    strict_transport_security=not DISABLE_HTTPS_REDIRECT,
-    content_security_policy=None,  # JSON API only
+    force_https=True,
+    strict_transport_security=True,
+    content_security_policy=None,  # no CSP for JSON API
 )
 
-# CORS (echo only if Origin matches our allowlist)
+# CORS (echo only if origin matches our allowlist)
 CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}}, supports_credentials=False, max_age=3600)
 
 # Rate limiting (Redis if configured, else in-memory)
 storage_options = {}
 if LIMITER_STORAGE_URI and LIMITER_STORAGE_URI.startswith("rediss://") and LIMITER_INSECURE_SSL:
-    # Some managed Redis instances present a self-signed link in chain
+    # If your Redis TLS chain is funky, allow insecure TLS to avoid SSL verify errors.
     storage_options["ssl_cert_reqs"] = ssl.CERT_NONE  # noqa: S501
 
 limiter = Limiter(
@@ -80,13 +73,10 @@ db.commutes.create_index([("createdAt", DESCENDING)])
 
 # ---------- Auth ----------
 def require_api_key() -> Optional[tuple[dict, int]]:
-    """
-    If API_KEY is set, require X-API-Key header to match. If API_KEY is empty,
-    allow all (useful for local dev).
-    """
+    """Return (json, status) if unauthorized, else None."""
     if not API_KEY:
-        return None
-    supplied = request.headers.get("x-api-key") or request.headers.get("X-API-Key")
+        return None  # no API key set -> allow (dev mode)
+    supplied = request.headers.get("x-api-key")
     if supplied != API_KEY:
         return jsonify({"error": "unauthorized", "detail": "invalid or missing API key"}), 401
     return None
@@ -106,7 +96,8 @@ class CommuteIn(BaseModel):
     passengers: int = Field(default=1, ge=1)
 
 
-# ---------- Emissions (fallback simple factors) ----------
+# ---------- Emissions ----------
+# Simple fallback factors (kg CO2e per km)
 _FACTORS = {"car": 0.192, "bus": 0.105, "train": 0.041, "bike": 0.0, "walk": 0.0}
 
 
@@ -207,8 +198,11 @@ def commute_create():
     auth = require_api_key()
     if auth:
         return auth
+
     payload = CommuteIn.model_validate_json(request.data or b"{}")
     kg, meta = calc_emissions(payload.distance_km, payload.mode, payload.passengers)
+
+    # Build the document we persist
     doc = {
         "createdAt": now_utc(),
         "distance_km": float(payload.distance_km),
@@ -218,9 +212,14 @@ def commute_create():
         "emissions_kgCO2e": kg,
         "meta": meta,
     }
+
+    # Insert; PyMongo mutates `doc` to add `_id`
     db.commutes.insert_one(doc)
-    out = dict(doc)
+
+    # ✅ Remove Mongo's ObjectId before JSON encoding
+    out = {k: v for k, v in doc.items() if k != "_id"}
     out["createdAt"] = out["createdAt"].isoformat()
+
     return jsonify({"data": out}), 201
 
 
