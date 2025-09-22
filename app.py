@@ -4,6 +4,7 @@ from pymongo import MongoClient, errors
 from dotenv import load_dotenv
 from datetime import datetime, timezone
 from werkzeug.exceptions import HTTPException
+from pydantic import BaseModel, Field, ValidationError
 import logging, sys, os
 
 load_dotenv(".env")
@@ -30,7 +31,31 @@ def _serialize(doc):
             out[k] = v
     return out
 
-# ----- core impls (so old + v1 routes share logic) -----
+def ensure_indexes():
+    if db is None:
+        return
+    db.samples.create_index([("createdAt", -1)])
+ensure_indexes()
+
+@app.errorhandler(HTTPException)
+def handle_http_err(e):
+    return {"error": e.name, "detail": e.description}, e.code
+
+@app.errorhandler(Exception)
+def handle_any_err(e):
+    log.exception("unhandled_error")
+    return {"error": "internal_error", "detail": str(e)}, 500
+
+@app.get("/")
+def root():
+    return {"service": "cleancommute-api", "version": "v1"}
+
+# -------- Validation models --------
+class SampleIn(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    status: str = Field(min_length=1, max_length=40)
+
+# -------- Core impls shared by v1 + legacy --------
 def health_impl():
     return {"status": "ok"}
 
@@ -54,29 +79,17 @@ def samples_get_impl():
 def samples_post_impl():
     if db is None:
         return {"error": "db not configured"}, 503
-    data = request.get_json(silent=True) or {}
-    if not isinstance(data, dict):
-        return {"error": "JSON body must be an object"}, 400
-    data["createdAt"] = datetime.now(timezone.utc)
-    result = db.samples.insert_one(data)
+    raw = request.get_json(silent=True) or {}
+    try:
+        payload = SampleIn.model_validate(raw)
+    except ValidationError as e:
+        return {"error": "validation_error", "detail": e.errors()}, 400
+    doc = payload.model_dump()
+    doc["createdAt"] = datetime.now(timezone.utc)
+    result = db.samples.insert_one(doc)
     return {"inserted_id": str(result.inserted_id)}, 201
 
-# ----- error handlers -----
-@app.errorhandler(HTTPException)
-def handle_http_err(e):
-    return {"error": e.name, "detail": e.description}, e.code
-
-@app.errorhandler(Exception)
-def handle_any_err(e):
-    log.exception("unhandled_error")
-    return {"error": "internal_error", "detail": str(e)}, 500
-
-# ----- root -----
-@app.get("/")
-def root():
-    return {"service": "cleancommute-api", "version": "v1"}
-
-# ----- v1 blueprint -----
+# -------- v1 blueprint --------
 api = Blueprint("api", __name__, url_prefix="/api/v1")
 
 @api.get("/health")
@@ -103,14 +116,14 @@ def v1_samples_post():
 
 app.register_blueprint(api)
 
-# ----- legacy paths (temporary compatibility) -----
+# -------- Legacy routes (temporary compatibility) --------
 @app.get("/health")
-def legacy_health():  # keep working while you migrate clients
-    return health_impl()
+def legacy_health():
+    return v1_health()
 
 @app.get("/db-ping")
 def legacy_db_ping():
-    return db_ping_impl()
+    return v1_db_ping()
 
 @app.get("/samples")
 def legacy_samples_get():
