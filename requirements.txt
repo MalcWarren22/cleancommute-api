@@ -6,3 +6,4 @@ flask-cors
 pydantic
 itsdangerous
 flask-talisman
+flask-limiter
