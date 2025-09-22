@@ -5,3 +5,4 @@ python-dotenv
 flask-cors
 pydantic
 itsdangerous
+flask-talisman
