@@ -8,13 +8,14 @@ on:
       - "Procfile"
       - ".github/workflows/deploy-heroku.yml"
   workflow_dispatch: {}
-
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
+        with:
+          fetch-depth: 0  # This fetches the full git history
+      
       # Push the current commit to Heroku via Git (no third-party action)
       - name: Deploy via Git to Heroku
         env:
