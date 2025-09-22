@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, Blueprint
 from flask_cors import CORS
 from pymongo import MongoClient, errors
 from dotenv import load_dotenv
@@ -30,6 +30,38 @@ def _serialize(doc):
             out[k] = v
     return out
 
+# ----- core impls (so old + v1 routes share logic) -----
+def health_impl():
+    return {"status": "ok"}
+
+def db_ping_impl():
+    if db is None:
+        return {"db": "missing_config"}, 503
+    db.command("ping")
+    return {"db": "ok"}
+
+def samples_get_impl():
+    if db is None:
+        return {"error": "db not configured"}, 503
+    limit = request.args.get("limit", "100")
+    try:
+        limit = max(1, min(int(limit), 1000))
+    except ValueError:
+        limit = 100
+    cursor = db.samples.find({}, {"_id": 0}).sort("createdAt", -1).limit(limit)
+    return jsonify([_serialize(d) for d in cursor])
+
+def samples_post_impl():
+    if db is None:
+        return {"error": "db not configured"}, 503
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return {"error": "JSON body must be an object"}, 400
+    data["createdAt"] = datetime.now(timezone.utc)
+    result = db.samples.insert_one(data)
+    return {"inserted_id": str(result.inserted_id)}, 201
+
+# ----- error handlers -----
 @app.errorhandler(HTTPException)
 def handle_http_err(e):
     return {"error": e.name, "detail": e.description}, e.code
@@ -39,49 +71,54 @@ def handle_any_err(e):
     log.exception("unhandled_error")
     return {"error": "internal_error", "detail": str(e)}, 500
 
+# ----- root -----
 @app.get("/")
 def root():
     return {"service": "cleancommute-api", "version": "v1"}
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+# ----- v1 blueprint -----
+api = Blueprint("api", __name__, url_prefix="/api/v1")
 
-@app.get("/db-ping")
-def db_ping():
-    if db is None:
-        return {"db": "missing_config"}, 503
-    db.command("ping")
-    return {"db": "ok"}
+@api.get("/health")
+def v1_health():
+    return health_impl()
 
-@app.get("/samples")
-def samples():
-    if db is None:
-        return {"error": "db not configured"}, 503
-    limit = request.args.get("limit", "100")
+@api.get("/db-ping")
+def v1_db_ping():
+    return db_ping_impl()
+
+@api.get("/samples")
+def v1_samples_get():
     try:
-        limit = max(1, min(int(limit), 1000))
-    except ValueError:
-        limit = 100
-    try:
-        cursor = db.samples.find({}, {"_id": 0}).sort("createdAt", -1).limit(limit)
-        return jsonify([_serialize(d) for d in cursor])
+        return samples_get_impl()
     except errors.PyMongoError as e:
         return {"error": "db read failed", "detail": str(e)}, 500
 
-@app.post("/samples")
-def add_sample():
-    if db is None:
-        return {"error": "db not configured"}, 503
-    data = request.get_json(silent=True) or {}
-    if not isinstance(data, dict):
-        return {"error": "JSON body must be an object"}, 400
-    data["createdAt"] = datetime.now(timezone.utc)
+@api.post("/samples")
+def v1_samples_post():
     try:
-        result = db.samples.insert_one(data)
-        return {"inserted_id": str(result.inserted_id)}, 201
+        return samples_post_impl()
     except errors.PyMongoError as e:
         return {"error": "db write failed", "detail": str(e)}, 500
+
+app.register_blueprint(api)
+
+# ----- legacy paths (temporary compatibility) -----
+@app.get("/health")
+def legacy_health():  # keep working while you migrate clients
+    return health_impl()
+
+@app.get("/db-ping")
+def legacy_db_ping():
+    return db_ping_impl()
+
+@app.get("/samples")
+def legacy_samples_get():
+    return v1_samples_get()
+
+@app.post("/samples")
+def legacy_samples_post():
+    return v1_samples_post()
 
 if __name__ == "__main__":
     app.run(debug=True)
