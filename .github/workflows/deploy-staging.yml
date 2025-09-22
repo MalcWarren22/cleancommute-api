@@ -1,0 +1,62 @@
+name: Deploy (staging)
+
+on:
+  push:
+    branches: ["staging"]
+
+concurrency:
+  group: deploy-staging
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      HEROKU_APP_NAME: clean-commute-api-staging
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Heroku CLI
+        run: curl https://cli-assets.heroku.com/install-ubuntu.sh | sh
+
+      - name: Auth Heroku (API key)
+        env:
+          HEROKU_API_KEY: ${{ secrets.HEROKU_API_KEY }}
+        run: |
+          cat > ~/.netrc <<EOF
+          machine api.heroku.com
+            login _
+            password $HEROKU_API_KEY
+          machine git.heroku.com
+            login _
+            password $HEROKU_API_KEY
+          EOF
+          heroku auth:whoami
+
+      - name: Ensure full git history
+        run: |
+          if git rev-parse --is-shallow-repository | grep -q true; then
+            git fetch --unshallow --tags
+          else
+            git fetch --tags
+          fi
+
+      - name: Push to Heroku (staging)
+        run: |
+          heroku git:remote -a "$HEROKU_APP_NAME"
+          # Push current commit to Heroku's 'main' (Heroku watches 'main' by default)
+          git push heroku HEAD:main --force
+
+      # Optional: basic smoke check of /api/v1/health
+      - name: Smoke check
+        run: |
+          WEB_URL=$(heroku apps:info -a "$HEROKU_APP_NAME" --json | python - <<'PY'
+import sys, json
+print(json.load(sys.stdin)["app"]["web_url"].strip())
+PY
+)
+          echo "Web URL: $WEB_URL"
+          curl -fsS "${WEB_URL%/}/api/v1/health"
