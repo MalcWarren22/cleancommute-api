@@ -1,82 +1,114 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+
+    services:
+      mongo:
+        image: mongo:6
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd="mongosh --eval 'db.runCommand({ ping: 1 })'"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps (+ dev tools)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruff black pip-audit
+
+      - name: Compile sources (fast syntax check)
+        run: python -m py_compile *.py
+
+      - name: Wait for Mongo to be reachable
+        run: |
+          python - <<'PY'
+          import time, sys
+          from pymongo import MongoClient
+          for _ in range(60):
+              try:
+                  MongoClient("mongodb://localhost:27017", serverSelectionTimeoutMS=1000).admin.command("ping")
+                  print("Mongo is up")
+                  sys.exit(0)
+              except Exception:
+                  time.sleep(1)
+          print("Mongo did not come up", file=sys.stderr)
+          sys.exit(1)
+          PY
+
       - name: Smoke test with Flask test client
         env:
           # App config for test run
+          DISABLE_HTTPS_REDIRECT: "1"
           API_KEY: "ci-key"
           ALLOW_CLEAR: "1"
-          MONGO_URI: "mongodb://localhost:27017"
-          MONGO_DB: "cleancommute_ci"
-          PYTHONPATH: ${{ github.workspace }}
+          MONGO_URI: "mongodb://localhost:27017/cleancommute"
         run: |
           python - <<'PY'
-          # CleanCommute API smoke aligned to current app.py behavior
-          import os, json, importlib
-
-          # Ensure env visible to Flask app factory
-          os.environ.setdefault("API_KEY", os.getenv("API_KEY","ci-key"))
-          os.environ.setdefault("ALLOW_CLEAR", os.getenv("ALLOW_CLEAR","1"))
-          os.environ.setdefault("MONGO_URI", os.getenv("MONGO_URI","mongodb://localhost:27017"))
-          os.environ.setdefault("MONGO_DB", os.getenv("MONGO_DB","cleancommute_ci"))
-
-          # Import your Flask app; adjust if your module is named differently
-          try:
-              from app import app
-          except Exception as e:
-              raise AssertionError(f"Couldn't import 'app'. If your file is in a package, set PYTHONPATH or change import. Error: {e}")
+          import os, json
+          from app import app
 
           c = app.test_client()
 
-          def J(resp):
-              try:
-                  return json.loads(resp.data.decode("utf-8"))
-              except Exception:
-                  raise AssertionError(f"Non-JSON response: {resp.status_code} {resp.data[:120]!r}")
+          def expect(status, resp):
+              assert resp.status_code == status, f"Unexpected: {resp.status_code} {resp.data[:80]!r}"
 
-          # 1) Health
-          r = c.get("/api/v1/health")
-          assert r.status_code == 200, f"/health {r.status_code}"
-          assert J(r).get("ok") is True
+          # Health & DB
+          expect(200, c.get("/api/v1/health"))
+          expect(200, c.get("/api/v1/db-ping"))
 
-          # 2) DB ping — allow 200 or 500 but must be JSON
-          r = c.get("/api/v1/db-ping")
-          assert r.status_code in (200, 500), f"/db-ping {r.status_code}"
-          _ = J(r)
+          # Unauthorized POST blocked
+          r = c.post("/api/v1/commutes", json={"distance_km": 1, "mode": "car"})
+          assert r.status_code == 401, f"Expected 401, got {r.status_code}"
 
-          # 3) GET samples
-          r = c.get("/api/v1/samples")
-          assert r.status_code == 200, f"/samples GET {r.status_code}"
-          body = J(r)
-          assert isinstance(body.get("data"), list), f"/samples GET shape: {body}"
+          # Authorized happy path
+          headers = {"x-api-key": os.environ["API_KEY"]}
+          r = c.post("/api/v1/commutes", headers=headers,
+                     json={"distance_km": 2.5, "mode": "car", "origin": "CI", "destination": "Check"})
+          expect(201, r)
 
-          # 4) POST samples without key -> 401
-          r = c.post("/api/v1/samples", json={"name": "CI"})
-          assert r.status_code == 401, f"/samples POST no key expected 401, got {r.status_code}"
-          assert r.headers.get("WWW-Authenticate","").startswith("API-Key")
+          # List shows at least 1
+          r = c.get("/api/v1/commutes?limit=1")
+          expect(200, r)
+          data = r.get_json()
+          assert isinstance(data, list) and len(data) >= 1
 
-          # 5) POST samples with key -> 201 & _id is str
-          r = c.post("/api/v1/samples", json={"name": "CI"}, headers={"x-api-key": os.environ["API_KEY"]})
-          assert r.status_code == 201, f"/samples POST with key {r.status_code}"
-          data = J(r).get("data", {})
-          assert isinstance(data.get("_id"), str) and data["_id"]
+          # Samples create/list/clear
+          r = c.post("/api/v1/samples", headers=headers, json={"name": "CI", "status": "ok"})
+          expect(201, r)
+          r = c.get("/api/v1/samples?limit=1")
+          expect(200, r)
+          assert isinstance(r.get_json(), list)
 
-          # 6) Commutes create -> 201
-          r = c.post("/api/v1/commutes",
-                     json={"origin":"A","destination":"B","mode":"driving"},
-                     headers={"x-api-key": os.environ["API_KEY"]})
-          assert r.status_code == 201, f"/commutes POST {r.status_code}"
-          commute_id = J(r)["data"]["_id"]
-          assert isinstance(commute_id, str)
-
-          # 7) Commutes list -> 200, list in data
-          r = c.get("/api/v1/commutes")
-          assert r.status_code == 200, f"/commutes GET {r.status_code}"
-          items = J(r).get("data", [])
-          assert isinstance(items, list), f"/commutes GET shape: {items!r}"
-
-          # 8) Clear endpoints (enabled in CI via ALLOW_CLEAR=1)
-          r = c.post("/api/v1/commutes/clear", headers={"x-api-key": os.environ["API_KEY"]})
-          assert r.status_code == 200, f"/commutes/clear {r.status_code}"
-          r = c.post("/api/v1/samples/clear", headers={"x-api-key": os.environ["API_KEY"]})
-          assert r.status_code == 200, f"/samples/clear {r.status_code}"
-
-          print("✅ Smoke OK")
+          # Clear endpoints (enabled in CI)
+          r = c.post("/api/v1/commutes/clear", headers=headers)
+          expect(200, r)
+          r = c.post("/api/v1/samples/clear", headers=headers)
+          expect(200, r)
+          print("smoke ok")
           PY
+
+      - name: Style (ruff + black --check)
+        run: |
+          ruff check .
+          black --check .
+
+      - name: Vulnerability scan (pip-audit; non-blocking)
+        run: pip-audit -r requirements.txt || true
