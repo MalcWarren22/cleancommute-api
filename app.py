@@ -1,16 +1,25 @@
 from flask import Flask, jsonify, request
+from flask_cors import CORS
 from pymongo import MongoClient, errors
 from dotenv import load_dotenv
 from datetime import datetime, timezone
-import os
+from werkzeug.exceptions import HTTPException
+import logging, sys, os
 
 load_dotenv(".env")
 MONGO_URI = os.getenv("MONGO_URI")
-
 client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000, retryWrites=True) if MONGO_URI else None
 db = client["cleancommute"] if client else None
 
 app = Flask(__name__)
+CORS(app)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+log = logging.getLogger(__name__)
 
 def _serialize(doc):
     out = {}
@@ -21,31 +30,46 @@ def _serialize(doc):
             out[k] = v
     return out
 
-@app.route("/health")
+@app.errorhandler(HTTPException)
+def handle_http_err(e):
+    return {"error": e.name, "detail": e.description}, e.code
+
+@app.errorhandler(Exception)
+def handle_any_err(e):
+    log.exception("unhandled_error")
+    return {"error": "internal_error", "detail": str(e)}, 500
+
+@app.get("/")
+def root():
+    return {"service": "cleancommute-api", "version": "v1"}
+
+@app.get("/health")
 def health():
     return {"status": "ok"}
 
-@app.route("/db-ping")
+@app.get("/db-ping")
 def db_ping():
     if db is None:
         return {"db": "missing_config"}, 503
-    try:
-        db.command("ping")
-        return {"db": "ok"}
-    except Exception as e:
-        return {"db": "error", "detail": str(e)}, 500
+    db.command("ping")
+    return {"db": "ok"}
 
-@app.route("/samples", methods=["GET"])
+@app.get("/samples")
 def samples():
     if db is None:
         return {"error": "db not configured"}, 503
+    limit = request.args.get("limit", "100")
     try:
-        cursor = db.samples.find({}, {"_id": 0}).sort("createdAt", -1)
+        limit = max(1, min(int(limit), 1000))
+    except ValueError:
+        limit = 100
+    try:
+        cursor = db.samples.find({}, {"_id": 0}).sort("createdAt", -1).limit(limit)
         return jsonify([_serialize(d) for d in cursor])
     except errors.PyMongoError as e:
         return {"error": "db read failed", "detail": str(e)}, 500
 
-@app.route("/samples", methods=["POST"])
+@app.post("/samples")
 def add_sample():
     if db is None:
         return {"error": "db not configured"}, 503
