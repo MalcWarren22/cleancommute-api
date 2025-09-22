@@ -1,45 +1,112 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+
+    # What the app expects during tests
+    env:
+      API_KEY: ci-key
+      DISABLE_HTTPS_REDIRECT: "1"   # app.py should honor this to avoid 302s in tests
+      MONGO_URI: "mongodb://localhost:27017"
+
+    services:
+      mongo:
+        image: mongo:7
+        ports:
+          - 27017:27017
+        # health check so we don't race the container
+        options: >-
+          --health-cmd="mongosh --eval 'db.runCommand({ ping: 1 })'"
+          --health-interval=10s --health-timeout=5s --health-retries=10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps (+ dev tools)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt ruff black pip-audit
+
+      - name: Compile sources (fast syntax check)
+        run: python -m py_compile *.py
+
+      - name: Wait for Mongo to be reachable
+        run: |
+          python - <<'PY'
+          import time, sys
+          from pymongo import MongoClient
+          for i in range(60):
+              try:
+                  MongoClient("mongodb://localhost:27017", serverSelectionTimeoutMS=500).admin.command("ping")
+                  print("Mongo is up"); sys.exit(0)
+              except Exception:
+                  time.sleep(1)
+          print("Mongo never came up"); sys.exit(1)
+          PY
+
       - name: Smoke test with Flask test client
         run: |
           python - <<'PY'
-          import os
-          os.environ.setdefault("DISABLE_HTTPS_REDIRECT","1")  # harmless if your app reads it; but we'll also call via https
-          from app import app
+          import os, json
+          # Make sure the app sees our test toggles
+          os.environ.setdefault("DISABLE_HTTPS_REDIRECT","1")
+          os.environ.setdefault("API_KEY","ci-key")
+          os.environ.setdefault("MONGO_URI","mongodb://localhost:27017")
 
+          from app import app
           c = app.test_client()
 
-          # always call over HTTPS so Flask-Talisman doesn't 302
-          def GET(path, **kw):  return c.open(path, method="GET",  base_url="https://localhost", **kw)
-          def POST(path, **kw): return c.open(path, method="POST", base_url="https://localhost", **kw)
+          def expect(code, resp):
+              body = resp.get_data(as_text=True)
+              assert resp.status_code == code, f"Unexpected: {resp.status_code} {body[:200]}"
 
-          def expect(code, resp, msg=""):
-              if resp.status_code != code:
-                  print("Unexpected:", resp.status_code, resp.data.decode())
-                  raise SystemExit(1)
+          # basic health
+          expect(200, c.get("/api/v1/health"))
+          expect(200, c.get("/api/v1/db-ping"))
 
-          # health / db
-          expect(200, GET("/api/v1/health"))
-          expect(200, GET("/api/v1/db-ping"))
+          # unauthorized should be blocked
+          r = c.post("/api/v1/commutes", json={"distance_km": 1, "mode": "car"})
+          assert r.status_code == 401
 
-          # unauthorized POST is blocked
-          r = POST("/api/v1/commutes", json={"distance_km": 1, "mode": "car"})
-          assert r.status_code == 401, r.status_code
-
+          # authorized happy path
           headers = {"x-api-key": os.environ["API_KEY"]}
-
-          # happy path
-          r = POST("/api/v1/commutes", headers=headers,
-                   json={"distance_km": 2.5, "mode": "car", "origin": "CI", "destination": "Check"})
+          r = c.post("/api/v1/commutes", headers=headers,
+                     json={"distance_km": 2.5, "mode": "car", "origin": "CI", "destination": "Check"})
           expect(201, r)
 
-          r = GET("/api/v1/commutes?limit=1")
+          # list should show at least one
+          r = c.get("/api/v1/commutes?limit=1")
           expect(200, r)
           data = r.get_json()
           assert isinstance(data, list) and len(data) >= 1
 
-          r = POST("/api/v1/samples", headers=headers, json={"name":"CI","status":"ok"})
+          # sample endpoints still work
+          r = c.post("/api/v1/samples", headers=headers, json={"name": "CI", "status": "ok"})
           expect(201, r)
-          r = GET("/api/v1/samples?limit=1")
-          expect(200, r)
+          expect(200, c.get("/api/v1/samples?limit=1"))
 
-          print("SMOKE OK")
+          print("smoke ok")
           PY
+
+      - name: Style (ruff + black --check)
+        run: |
+          ruff check .
+          black --check .
+
+      - name: Vulnerability scan (pip-audit; non-blocking)
+        continue-on-error: true
+        run: pip-audit -r requirements.txt || true
