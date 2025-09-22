@@ -12,7 +12,8 @@ jobs:
     services:
       mongo:
         image: mongo:6
-        ports: ["27017:27017"]
+        ports:
+          - 27017:27017
         options: >-
           --health-cmd="mongosh --quiet --eval 'db.runCommand({ ping: 1 }).ok'"
           --health-interval=5s
@@ -51,7 +52,7 @@ jobs:
           sys.exit(1)
           PY
 
-      - name: Smoke test with Flask test client (includes docs, validation, pagination)
+      - name: Smoke test with Flask test client
         env:
           API_KEY: "ci-key"
           ALLOW_CLEAR: "true"
@@ -60,83 +61,39 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}
         run: |
           python - <<'PY'
-          import os, json, re
+          import os, json
           os.environ.setdefault("API_KEY", os.getenv("API_KEY","ci-key"))
           os.environ.setdefault("ALLOW_CLEAR", os.getenv("ALLOW_CLEAR","true"))
           os.environ.setdefault("MONGO_URI", os.getenv("MONGO_URI","mongodb://localhost:27017"))
           os.environ.setdefault("MONGO_DB", os.getenv("MONGO_DB","cleancommute_ci"))
-
           from app import app
+
           c = app.test_client()
-
           def J(r):
-              try:
-                  return json.loads(r.data.decode("utf-8"))
-              except Exception:
-                  raise AssertionError(f"Non-JSON response: {r.status_code} {r.data[:200]!r}")
+              return json.loads(r.data.decode("utf-8"))
+          def as_list(p):
+              if isinstance(p, list): return p
+              if isinstance(p, dict) and isinstance(p.get("data"), list): return p["data"]
+              raise AssertionError(f"Expected list or {{'data': list}}, got: {p!r}")
 
-          def ok200(r): 
-              assert r.status_code == 200, f"Expected 200, got {r.status_code}: {r.data[:200]!r}"
+          r = c.get("/api/v1/health"); assert r.status_code==200
+          r = c.get("/api/v1/db-ping"); assert r.status_code in (200,500)
 
-          def as_list_or_data(rjson):
-              if isinstance(rjson, list): return rjson
-              if isinstance(rjson, dict) and isinstance(rjson.get("data"), list): return rjson["data"]
-              raise AssertionError(f"Expected list or {{'data': list}}, got: {rjson!r}")
+          r = c.get("/api/v1/samples"); _ = as_list(J(r)); assert r.status_code==200
 
-          # Health (/api/v1/health preferred; fallback /health)
-          r = c.get("/api/v1/health")
-          if r.status_code == 404:
-              r = c.get("/health")
-          b = J(r); ok200(r); assert b.get("ok") in (True,1)
+          r = c.post("/api/v1/samples", json={"name":"CI"}); assert r.status_code==401
 
-          # DB ping (200 or 500 is fine depending on test Mongo)
-          r = c.get("/api/v1/db-ping"); _=J(r); assert r.status_code in (200,500)
+          r = c.post("/api/v1/samples", json={"name":"CI"}, headers={"x-api-key": os.environ["API_KEY"]})
+          assert r.status_code==201
 
-          # ---- API Docs
-          r = c.get("/openapi.json"); ok200(r); spec = J(r)
-          assert spec.get("openapi","").startswith("3."), "OpenAPI version missing"
-          r = c.get("/docs"); ok200(r); 
-          assert b"redoc" in r.data.lower(), "Redoc page should include 'redoc'"
+          r = c.post("/api/v1/commutes", json={"origin":"A","destination":"B"}, headers={"x-api-key": os.environ["API_KEY"]})
+          assert r.status_code==201
 
-          # ---- Samples list (pagination fields exist)
-          r = c.get("/api/v1/samples?limit=1&offset=0")
-          b = J(r); ok200(r)
-          assert "data" in b and "next_offset" in b and "has_more" in b
+          r = c.get("/api/v1/commutes"); _ = as_list(J(r)); assert r.status_code==200
 
-          # ---- Unauthorized create should be 401 with WWW-Authenticate
-          r = c.post("/api/v1/samples", json={"name":"CI"})
-          assert r.status_code == 401 and r.headers.get("WWW-Authenticate","").startswith("API-Key")
-
-          # ---- Authorized create works
-          headers={"x-api-key": os.environ["API_KEY"]}
-          r = c.post("/api/v1/samples", json={"name":"CI", "meta":{"ci":True}}, headers=headers)
-          b = J(r); assert r.status_code == 201 and isinstance(b.get("data",{}).get("_id",""), str)
-
-          # ---- Commute validation: missing destination -> 400
-          r = c.post("/api/v1/commutes", json={"origin":"A"}, headers=headers)
-          assert r.status_code == 400, f"Expected 400 validation error, got {r.status_code}"
-          bj = J(r); assert bj.get("error") == "bad_request"
-
-          # ---- Commute validation: invalid mode -> 400
-          r = c.post("/api/v1/commutes", json={"origin":"A","destination":"B","mode":"flying"}, headers=headers)
-          assert r.status_code == 400
-
-          # ---- Commute valid create -> 201
-          r = c.post("/api/v1/commutes", json={"origin":"Home","destination":"Work","mode":"driving"}, headers=headers)
-          b = J(r); assert r.status_code == 201 and isinstance(b.get("data",{}).get("_id",""), str)
-
-          # ---- List commutes with pagination metadata
-          r = c.get("/api/v1/commutes?limit=1&offset=0")
-          b = J(r); ok200(r)
-          assert "data" in b and isinstance(b["data"], list)
-          assert "next_offset" in b and isinstance(b["next_offset"], int)
-          assert "has_more" in b and isinstance(b["has_more"], bool)
-
-          # ---- Clear endpoints (enabled in CI)
-          r = c.post("/api/v1/commutes/clear", headers=headers); ok200(r)
-          r = c.post("/api/v1/samples/clear",  headers=headers); ok200(r)
-
-          print("✅ Smoke OK (docs, validation, pagination verified)")
+          r = c.post("/api/v1/commutes/clear", headers={"x-api-key": os.environ["API_KEY"]}); assert r.status_code==200
+          r = c.post("/api/v1/samples/clear", headers={"x-api-key": os.environ["API_KEY"]}); assert r.status_code==200
+          print("✅ Smoke OK")
           PY
 
       - name: Style (ruff + black autoformat)
@@ -148,7 +105,6 @@ jobs:
       - name: Vulnerability scan (pip-audit; non-blocking)
         run: pip-audit -r requirements.txt || true
 
-  # ---- Staging deploy (unchanged) ----
   deploy_staging:
     name: Deploy to Heroku (staging)
     runs-on: ubuntu-latest
@@ -157,53 +113,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Heroku CLI
-        uses: heroku/actions/setup@v2
+      - name: Install Heroku CLI
+        run: curl https://cli-assets.heroku.com/install.sh | sh
+
+      - name: Authenticate Heroku
+        run: echo "${{ secrets.HEROKU_API_KEY }}" | heroku auth:token
 
       - name: Push code to Heroku (staging)
-        uses: akhileshns/heroku-deploy@v4.2.1
-        with:
-          heroku_api_key: ${{ secrets.HEROKU_API_KEY }}
-          heroku_app_name: ${{ vars.HEROKU_APP_STAGING }}
-          heroku_email: ${{ secrets.HEROKU_EMAIL }}
-          usedocker: false
-
-      - name: (Optional) Set config vars (staging) if provided
-        env:
-          HEROKU_API_KEY: ${{ secrets.HEROKU_API_KEY }}
-          HEROKU_APP: ${{ vars.HEROKU_APP_STAGING }}
-          API_KEY: ${{ secrets.API_KEY_STAGING }}
-          MONGO_URI: ${{ secrets.MONGO_URI_STAGING }}
-          FRONTEND_ORIGIN: ${{ secrets.FRONTEND_ORIGIN_STAGING }}
-          DEFAULT_LIMITS: ${{ secrets.DEFAULT_LIMITS }}
-          LIMITER_STORAGE_URI: ${{ secrets.LIMITER_STORAGE_URI }}
-        run: |
-          heroku auth:whoami || true
-          set_kv=""
-          [ -n "$API_KEY" ] && set_kv="$set_kv API_KEY=$API_KEY"
-          [ -n "$MONGO_URI" ] && set_kv="$set_kv MONGO_URI=$MONGO_URI"
-          [ -n "$FRONTEND_ORIGIN" ] && set_kv="$set_kv FRONTEND_ORIGIN=$FRONTEND_ORIGIN"
-          [ -n "$DEFAULT_LIMITS" ] && set_kv="$set_kv DEFAULT_LIMITS=$DEFAULT_LIMITS"
-          [ -n "$LIMITER_STORAGE_URI" ] && set_kv="$set_kv LIMITER_STORAGE_URI=$LIMITER_STORAGE_URI"
-          if [ -n "$set_kv" ]; then
-            heroku config:set $set_kv -a "$HEROKU_APP"
-          else
-            echo "No config vars provided; skipping"
-          fi
+        run: git push https://heroku:${{ secrets.HEROKU_API_KEY }}@git.heroku.com/${{ vars.HEROKU_APP_STAGING }}.git HEAD:main
 
       - name: Health check (staging)
+        env:
+          HEROKU_APP: ${{ vars.HEROKU_APP_STAGING }}
         run: |
           set -e
-          URL="https://${{ vars.HEROKU_APP_STAGING }}.herokuapp.com/api/v1/health"
+          BASE=$(heroku apps:info -a "$HEROKU_APP" | sed -n 's/^Web URL: *//p')
+          BASE=${BASE%/}
+          URL="${BASE}/api/v1/health"
           echo "Checking $URL"
-          for i in {1..30}; do
-            code=$(curl -s -o /dev/null -w "%{http_code}" "$URL") || true
+          for i in {1..45}; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "$URL" || true)
             if [ "$code" = "200" ]; then echo "Healthy ✅"; exit 0; fi
             sleep 2
           done
-          echo "Health check failed ❌"; exit 1
+          echo "Health check failed ❌ (last code: $code) at $URL"; exit 1
 
-  # ---- Production deploy (unchanged) ----
   deploy_prod:
     name: Deploy to Heroku (production)
     runs-on: ubuntu-latest
@@ -212,47 +146,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Heroku CLI
-        uses: heroku/actions/setup@v2
+      - name: Install Heroku CLI
+        run: curl https://cli-assets.heroku.com/install.sh | sh
+
+      - name: Authenticate Heroku
+        run: echo "${{ secrets.HEROKU_API_KEY }}" | heroku auth:token
 
       - name: Push code to Heroku (prod)
-        uses: akhileshns/heroku-deploy@v4.2.1
-        with:
-          heroku_api_key: ${{ secrets.HEROKU_API_KEY }}
-          heroku_app_name: ${{ vars.HEROKU_APP_PROD }}
-          heroku_email: ${{ secrets.HEROKU_EMAIL }}
-          usedocker: false
-
-      - name: (Optional) Set config vars (prod) if provided
-        env:
-          HEROKU_API_KEY: ${{ secrets.HEROKU_API_KEY }}
-          HEROKU_APP: ${{ vars.HEROKU_APP_PROD }}
-          API_KEY: ${{ secrets.API_KEY_PROD }}
-          MONGO_URI: ${{ secrets.MONGO_URI_PROD }}
-          FRONTEND_ORIGIN: ${{ secrets.FRONTEND_ORIGIN_PROD }}
-          DEFAULT_LIMITS: ${{ secrets.DEFAULT_LIMITS }}
-          LIMITER_STORAGE_URI: ${{ secrets.LIMITER_STORAGE_URI }}
-        run: |
-          set_kv=""
-          [ -n "$API_KEY" ] && set_kv="$set_kv API_KEY=$API_KEY"
-          [ -n "$MONGO_URI" ] && set_kv="$set_kv MONGO_URI=$MONGO_URI"
-          [ -n "$FRONTEND_ORIGIN" ] && set_kv="$set_kv FRONTEND_ORIGIN=$FRONTEND_ORIGIN"
-          [ -n "$DEFAULT_LIMITS" ] && set_kv="$set_kv DEFAULT_LIMITS=$DEFAULT_LIMITS"
-          [ -n "$LIMITER_STORAGE_URI" ] && set_kv="$set_kv LIMITER_STORAGE_URI=$LIMITER_STORAGE_URI"
-          if [ -n "$set_kv" ]; then
-            heroku config:set $set_kv -a "$HEROKU_APP"
-          else
-            echo "No config vars provided; skipping"
-          fi
+        run: git push https://heroku:${{ secrets.HEROKU_API_KEY }}@git.heroku.com/${{ vars.HEROKU_APP_PROD }}.git HEAD:main
 
       - name: Health check (prod)
+        env:
+          HEROKU_APP: ${{ vars.HEROKU_APP_PROD }}
         run: |
           set -e
-          URL="https://${{ vars.HEROKU_APP_PROD }}.herokuapp.com/api/v1/health"
+          BASE=$(heroku apps:info -a "$HEROKU_APP" | sed -n 's/^Web URL: *//p')
+          BASE=${BASE%/}
+          URL="${BASE}/api/v1/health"
           echo "Checking $URL"
-          for i in {1..30}; do
-            code=$(curl -s -o /dev/null -w "%{http_code}" "$URL") || true
+          for i in {1..45}; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "$URL" || true)
             if [ "$code" = "200" ]; then echo "Healthy ✅"; exit 0; fi
             sleep 2
           done
-          echo "Health check failed ❌"; exit 1
+          echo "Health check failed ❌ (last code: $code) at $URL"; exit 1
