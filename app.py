@@ -1,7 +1,7 @@
 import os
 import json
 from functools import wraps
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict
 
 from flask import Flask, request, current_app
@@ -60,6 +60,10 @@ def create_app() -> Flask:
         pass
 
     # ---- Helpers --------------------------------------------------------------
+    def _now_utc_iso() -> str:
+        # timezone-aware, consistent "Z" suffix
+        return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
     def sanitize_mongo(obj: Any) -> Any:
         if isinstance(obj, ObjectId):
             return str(obj)
@@ -93,7 +97,7 @@ def create_app() -> Flask:
     def ok(data: Dict[str, Any] | list | None = None, **extra):
         payload: Dict[str, Any] = {
             "ok": True,
-            "ts": datetime.utcnow().isoformat() + "Z",
+            "ts": _now_utc_iso(),
         }
         if data is not None:
             payload["data"] = sanitize_mongo(data)  # ensure JSON-safe ids
@@ -129,7 +133,7 @@ def create_app() -> Flask:
     @require_api_key
     def add_sample():
         doc = request.get_json(silent=True) or {}
-        doc["created_at"] = datetime.utcnow().isoformat() + "Z"
+        doc["created_at"] = _now_utc_iso()
         samples.insert_one(doc)
         return ok(doc), 201
 
@@ -155,7 +159,7 @@ def create_app() -> Flask:
         missing = [k for k in required if k not in payload]
         if missing:
             return json_err(f"missing fields: {', '.join(missing)}", 400)
-        payload["created_at"] = datetime.utcnow().isoformat() + "Z"
+        payload["created_at"] = _now_utc_iso()
         commutes.insert_one(payload)
         return ok(payload), 201
 
