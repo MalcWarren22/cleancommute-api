@@ -3,9 +3,11 @@ import json
 from functools import wraps
 from datetime import datetime, timezone
 from typing import Any, Dict
-from dotenv import load_dotenv
-load_dotenv()
 
+from dotenv import load_dotenv
+
+# Load .env from the repo directory explicitly; override any shell vars
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"), override=True)
 
 from flask import Flask, request, current_app
 from flask_cors import CORS
@@ -24,18 +26,17 @@ def create_app() -> Flask:
 
     # ---- Config (env-backed) -------------------------------------------------
     app.config["API_KEY"] = os.getenv("API_KEY", "")
-    # Default to CI/Actions Mongo service if not provided
-    app.config["MONGO_URI"] = os.getenv("MONGO_URI", "mongodb://localhost:27017")
-    app.config["MONGO_DB"] = os.getenv("MONGO_DB", "cleancommute")
-    app.config["DEFAULT_LIMITS"] = os.getenv("DEFAULT_LIMITS", "100 per 15 minutes")
-    app.config["ALLOW_CLEAR"] = os.getenv("ALLOW_CLEAR", "false").lower() == "true"
-    app.config["FRONTEND_ORIGIN"] = os.getenv("FRONTEND_ORIGIN", "*")
-    limiter_storage = os.getenv("LIMITER_STORAGE_URI")  # e.g., redis://...
+    app.config["MONGO_URI"] = os.getenv("MONGO_URI", "mongodb://localhost:27017").strip()
+    app.config["MONGO_DB"] = os.getenv("MONGO_DB", "cleancommute").strip()
+    app.config["DEFAULT_LIMITS"] = os.getenv("DEFAULT_LIMITS", "100 per 15 minutes").strip()
+    app.config["ALLOW_CLEAR"] = os.getenv("ALLOW_CLEAR", "false").strip().lower() == "true"
+    app.config["FRONTEND_ORIGIN"] = os.getenv("FRONTEND_ORIGIN", "*").strip()
+    limiter_storage = (os.getenv("LIMITER_STORAGE_URI") or "").strip()  # e.g., redis://...
 
     # CORS (only under /api/* to the configured frontend)
     CORS(app, resources={r"/api/*": {"origins": app.config["FRONTEND_ORIGIN"]}})
 
-    # Rate limiting — pass storage_uri directly with app to avoid warning
+    # Rate limiting — pass storage_uri directly with app to avoid warnings
     Limiter(
         app=app,
         key_func=get_remote_address,
