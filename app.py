@@ -3,6 +3,9 @@ import json
 from functools import wraps
 from datetime import datetime, timezone
 from typing import Any, Dict
+from dotenv import load_dotenv
+load_dotenv()
+
 
 from flask import Flask, request, current_app
 from flask_cors import CORS
