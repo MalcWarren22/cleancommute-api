@@ -1,199 +1,118 @@
 import os
-import json
-from functools import wraps
-from datetime import datetime, timezone
-from typing import Any, Dict
+import logging
+from typing import Optional
 
-from dotenv import load_dotenv
-
-# Load .env from the repo directory explicitly; override any shell vars
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"), override=True)
-
-from flask import Flask, request, current_app
+from flask import Flask, jsonify, request
 from flask_cors import CORS
-from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
+from dotenv import load_dotenv, find_dotenv
 from pymongo import MongoClient
-from pymongo.errors import ServerSelectionTimeoutError
-from bson import ObjectId
 from werkzeug.middleware.proxy_fix import ProxyFix
 
+# ---- Load .env EARLY (dev); real env wins in Heroku (override=False) ----
+load_dotenv(find_dotenv(), override=False)
 
-def create_app() -> Flask:
-    app = Flask(__name__)
-    # Respect reverse proxy headers (Heroku, etc.)
-    app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)  # type: ignore
+# ---- Logging ----
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("cleancommute")
 
-    # ---- Config (env-backed) -------------------------------------------------
-    app.config["API_KEY"] = os.getenv("API_KEY", "")
-    app.config["MONGO_URI"] = os.getenv("MONGO_URI", "mongodb://localhost:27017").strip()
-    app.config["MONGO_DB"] = os.getenv("MONGO_DB", "cleancommute").strip()
-    app.config["DEFAULT_LIMITS"] = os.getenv("DEFAULT_LIMITS", "100 per 15 minutes").strip()
-    app.config["ALLOW_CLEAR"] = os.getenv("ALLOW_CLEAR", "false").strip().lower() == "true"
-    app.config["FRONTEND_ORIGIN"] = os.getenv("FRONTEND_ORIGIN", "*").strip()
-    limiter_storage = (os.getenv("LIMITER_STORAGE_URI") or "").strip()  # e.g., redis://...
+# ---- Helpers ----
+def _istrue(v: Optional[str]) -> bool:
+    return (v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
-    # CORS (only under /api/* to the configured frontend)
-    CORS(app, resources={r"/api/*": {"origins": app.config["FRONTEND_ORIGIN"]}})
+# ---- Env ----
+FLASK_ENV            = os.getenv("FLASK_ENV", "production")
+MONGO_URI            = os.getenv("MONGO_URI", "mongodb://localhost:27017")
+MONGO_DB             = os.getenv("MONGO_DB", "cleancommute")
+API_KEY              = os.getenv("API_KEY", "")
+FRONTEND_ORIGIN      = os.getenv("FRONTEND_ORIGIN", "")
+DEFAULT_LIMITS       = os.getenv("DEFAULT_LIMITS", "100 per minute")
+LIMITER_STORAGE_URI  = os.getenv("LIMITER_STORAGE_URI", "memory://")
+ALLOW_CLEAR          = _istrue(os.getenv("ALLOW_CLEAR"))
 
-    # Rate limiting — pass storage_uri directly with app to avoid warnings
-    Limiter(
-        app=app,
-        key_func=get_remote_address,
-        default_limits=[app.config["DEFAULT_LIMITS"]],
-        storage_uri=limiter_storage or "memory://",
-    )
+log.info(
+    "ENV CHECK → ALLOW_CLEAR=%s | MONGO_URI=%s | MONGO_DB=%s | FRONTEND_ORIGIN=%s | LIMITER_STORAGE_URI=%s",
+    ALLOW_CLEAR, MONGO_URI, MONGO_DB, FRONTEND_ORIGIN, LIMITER_STORAGE_URI
+)
 
-    # ---- Mongo ----------------------------------------------------------------
-    mongo_client = MongoClient(
-        app.config["MONGO_URI"],
-        serverSelectionTimeoutMS=3000,
-        connectTimeoutMS=3000,
-        socketTimeoutMS=3000,
-        retryWrites=True,
-    )
-    db = mongo_client.get_database(app.config["MONGO_DB"])
-    samples = db["samples"]
-    commutes = db["commutes"]
+# ---- App ----
+app = Flask(__name__)
+app.url_map.strict_slashes = False  # avoid /path vs /path/ 404s
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
 
-    # Try a ping, but don’t kill the app in CI/dev
+# ---- CORS (allow only your configured frontend if provided) ----
+if FRONTEND_ORIGIN:
+    CORS(app, resources={r"/api/*": {"origins": [FRONTEND_ORIGIN]}})
+else:
+    CORS(app, resources={r"/api/*": {"origins": "*"}})  # dev-friendly
+
+# ---- DB ----
+client = MongoClient(MONGO_URI, connectTimeoutMS=5000, serverSelectionTimeoutMS=5000)
+db = client[MONGO_DB]
+
+# ---- Routes ----
+@app.route("/api/v1/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"}), 200
+
+@app.route("/api/v1/db-ping", methods=["GET"])
+def db_ping():
     try:
-        mongo_client.admin.command("ping")
-    except ServerSelectionTimeoutError:
-        # still start; endpoints that need DB will surface 503s
-        pass
+        db.command("ping")
+        return jsonify({"db": "reachable"}), 200
+    except Exception as e:
+        log.exception("DB ping failed")
+        return jsonify({"error": f"db unreachable: {e}"}), 500
 
-    # ---- Helpers --------------------------------------------------------------
-    def _now_utc_iso() -> str:
-        # timezone-aware, consistent "Z" suffix
-        return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+@app.route("/api/v1/samples", methods=["GET"])
+def list_samples():
+    items = []
+    for doc in db.samples.find({}, {"_id": 0}).limit(100):
+        items.append(doc)
+    return jsonify({"items": items}), 200
 
-    def sanitize_mongo(obj: Any) -> Any:
-        if isinstance(obj, ObjectId):
-            return str(obj)
-        if isinstance(obj, list):
-            return [sanitize_mongo(x) for x in obj]
-        if isinstance(obj, dict):
-            return {k: sanitize_mongo(v) for k, v in obj.items()}
-        return obj
+@app.route("/api/v1/samples", methods=["POST"])
+def add_sample():
+    # writes require x-api-key
+    key = request.headers.get("x-api-key", "")
+    if not API_KEY or key != API_KEY:
+        return jsonify({"error": "unauthorized"}), 401
 
-    def json_ok(payload: Dict[str, Any], status: int = 200):
-        body = json.dumps(payload, default=str)
-        return current_app.response_class(body, mimetype="application/json", status=status)
+    payload = request.get_json(silent=True) or {}
+    if not payload:
+        return jsonify({"error": "missing json body"}), 400
 
-    def json_err(message: str, status: int = 400):
-        return json_ok({"ok": False, "error": message}, status=status)
+    try:
+        db.samples.insert_one(payload)
+        return jsonify({"ok": True}), 201
+    except Exception as e:
+        log.exception("Insert failed")
+        return jsonify({"error": f"insert failed: {e}"}), 500
 
-    # Enforce API key on mutating endpoints
-    def require_api_key(f):
-        @wraps(f)
-        def wrapper(*args, **kwargs):
-            expected = current_app.config.get("API_KEY", "")
-            # If API_KEY isn’t configured (e.g., CI), allow the call
-            if expected:
-                provided = request.headers.get("x-api-key")
-                if provided != expected:
-                    return json_err("unauthorized", 401)
-            return f(*args, **kwargs)
-        return wrapper
+@app.route("/api/v1/samples/clear", methods=["POST"])
+def clear_samples():
+    # writes require x-api-key
+    key = request.headers.get("x-api-key", "")
+    if not API_KEY or key != API_KEY:
+        return jsonify({"error": "unauthorized"}), 401
 
-    # Envelope helper
-    def ok(data: Dict[str, Any] | list | None = None, **extra):
-        payload: Dict[str, Any] = {
-            "ok": True,
-            "ts": _now_utc_iso(),
-        }
-        if data is not None:
-            payload["data"] = sanitize_mongo(data)  # ensure JSON-safe ids
-        if extra:
-            payload.update(extra)
-        return json_ok(payload)
+    if not ALLOW_CLEAR:
+        return jsonify({"error": "clears disabled (ALLOW_CLEAR=false)"}), 403
 
-    # ---- Routes ---------------------------------------------------------------
-    @app.get("/api/v1/health")
-    def health():
-        return ok(
-            {
-                "service": "clean-commute-api",
-                "env": os.getenv("FLASK_ENV", "production"),
-            }
-        )
+    try:
+        res = db.samples.delete_many({})
+        return jsonify({"ok": True, "deleted": res.deleted_count}), 200
+    except Exception as e:
+        log.exception("Delete failed")
+        return jsonify({"error": f"delete failed: {e}"}), 500
 
-    @app.get("/api/v1/db-ping")
-    def db_ping():
-        try:
-            mongo_client.admin.command("ping")
-            return ok({"mongo": "up"})
-        except ServerSelectionTimeoutError as e:
-            return json_err(f"mongo_unreachable: {e}", 503)
-
-    # ---- Samples --------------------------------------------------------------
-    @app.get("/api/v1/samples")
-    def get_samples():
-        items = list(samples.find({}, {"_id": 0}).limit(100))
-        return ok(items)
-
-    @app.post("/api/v1/samples")
-    @require_api_key
-    def add_sample():
-        doc = request.get_json(silent=True) or {}
-        doc["created_at"] = _now_utc_iso()
-        samples.insert_one(doc)
-        return ok(doc), 201
-
-    @app.post("/api/v1/samples/clear")
-    @require_api_key
-    def clear_samples():
-        if not app.config["ALLOW_CLEAR"]:
-            return json_err("clearing disabled (set ALLOW_CLEAR=true to enable)", 403)
-        samples.delete_many({})
-        return ok({"cleared": True})
-
-    # ---- Commutes -------------------------------------------------------------
-    @app.get("/api/v1/commutes")
-    def get_commutes():
-        items = list(commutes.find({}, {"_id": 0}).limit(500))
-        return ok(items)
-
-    @app.post("/api/v1/commutes")
-    @require_api_key
-    def add_commute():
-        payload = request.get_json(silent=True) or {}
-        required = ["origin", "destination", "mode"]
-        missing = [k for k in required if k not in payload]
-        if missing:
-            return json_err(f"missing fields: {', '.join(missing)}", 400)
-        payload["created_at"] = _now_utc_iso()
-        commutes.insert_one(payload)
-        return ok(payload), 201
-
-    @app.post("/api/v1/commutes/clear")
-    @require_api_key
-    def clear_commutes():
-        if not app.config["ALLOW_CLEAR"]:
-            return json_err("clearing disabled (set ALLOW_CLEAR=true to enable)", 403)
-        commutes.delete_many({})
-        return ok({"cleared": True})
-
-    # Root helper
-    @app.get("/")
-    def root():
-        return ok(
-            {
-                "endpoints": [
-                    "/api/v1/health",
-                    "/api/v1/db-ping",
-                    "/api/v1/samples [GET, POST, POST /clear]",
-                    "/api/v1/commutes [GET, POST, POST /clear]",
-                ]
-            }
-        )
-
-    return app
-
-
-# Expose a module-level app for gunicorn (`wsgi:application` or `app:app`)
-app = create_app()
+# Optional: quick route list for debugging 404s (comment out in prod)
+@app.route("/_routes")
+def _routes():
+    rules = [
+        {"rule": str(r), "methods": sorted(list(r.methods - {'HEAD', 'OPTIONS'}))}
+        for r in app.url_map.iter_rules()
+    ]
+    return jsonify(rules), 200
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+    app.run(host="127.0.0.1", port=5000, debug=(FLASK_ENV != "production"))
