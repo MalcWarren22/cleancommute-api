@@ -9,3 +9,8 @@ a/
 creates/
 project-local/
 #
+.env
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
