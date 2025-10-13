@@ -72,7 +72,6 @@ log.info(
     "ENV → FLASK_ENV=%s | ALLOW_CLEAR=%s | MONGO_URI=%s | MONGO_DB=%s | FRONTEND_ORIGIN=%s",
     FLASK_ENV,
     ALLOW_CLEAR,
-    # Safe to log full URI for dev; redact if you prefer
     MONGO_URI,
     MONGO_DB_NAME,
     FRONTEND_ORIGIN,
@@ -108,7 +107,7 @@ def root():
         "version": "v1",
         "health": "/health",
         "db_ping": "/db-ping",
-        "docs": "/_routes"
+        "routes": "/_routes"
     }), 200
 
 @app.get("/health")
@@ -118,4 +117,95 @@ def health_root():
 @app.get("/db-ping")
 def db_ping_root():
     try:
-        if
+        if not mongo_client:
+            raise RuntimeError("No Mongo client")
+        mongo_client.admin.command("ping")
+        return jsonify({"ok": True}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+# Versioned aliases
+@app.get("/api/v1/health")
+def health_v1():
+    return health_root()
+
+@app.get("/api/v1/db-ping")
+def db_ping_v1():
+    return db_ping_root()
+
+# ------------------------------------------------------------
+# Samples endpoints (simple smoke tests)
+# ------------------------------------------------------------
+@app.post("/api/v1/samples")
+def add_sample():
+    require_key()
+    if not _mongo_ok():
+        return jsonify({"error": "Database unavailable"}), 503
+    payload = request.get_json(silent=True) or {}
+    res = db.samples.insert_one(payload)
+    return jsonify({"inserted_id": str(res.inserted_id)}), 201
+
+@app.get("/api/v1/samples")
+def list_samples():
+    if not _mongo_ok():
+        return jsonify({"error": "Database unavailable"}), 503
+    docs = list(db.samples.find({}, {"_id": 0}))
+    return jsonify(docs), 200
+
+@app.delete("/api/v1/samples/clear")
+def clear_samples():
+    if not ALLOW_CLEAR:
+        abort(403, description="Clearing is disabled")
+    require_key()
+    if not _mongo_ok():
+        return jsonify({"error": "Database unavailable"}), 503
+    res = db.samples.delete_many({})
+    return jsonify({"deleted": res.deleted_count}), 200
+
+# ------------------------------------------------------------
+# Commutes endpoints (example resource)
+# ------------------------------------------------------------
+@app.post("/api/v1/commutes")
+def add_commute():
+    require_key()
+    if not _mongo_ok():
+        return jsonify({"error": "Database unavailable"}), 503
+    payload = request.get_json(silent=True) or {}
+    res = db.commutes.insert_one(payload)
+    return jsonify({"inserted_id": str(res.inserted_id)}), 201
+
+@app.get("/api/v1/commutes")
+def list_commutes():
+    if not _mongo_ok():
+        return jsonify({"error": "Database unavailable"}), 503
+    docs = list(db.commutes.find({}, {"_id": 0}))
+    return jsonify(docs), 200
+
+@app.delete("/api/v1/commutes/clear")
+def clear_commutes():
+    if not ALLOW_CLEAR:
+        abort(403, description="Clearing is disabled")
+    require_key()
+    if not _mongo_ok():
+        return jsonify({"error": "Database unavailable"}), 503
+    res = db.commutes.delete_many({})
+    return jsonify({"deleted": res.deleted_count}), 200
+
+# ------------------------------------------------------------
+# Introspection (optional)
+# ------------------------------------------------------------
+@app.get("/_routes")
+def list_routes():
+    rules = []
+    for r in app.url_map.iter_rules():
+        methods = ",".join(sorted(r.methods - {"HEAD", "OPTIONS"}))
+        rules.append({"rule": str(r), "endpoint": r.endpoint, "methods": methods})
+    rules.sort(key=lambda x: x["rule"])
+    return jsonify(rules), 200
+
+# ------------------------------------------------------------
+# Gunicorn entrypoint
+# ------------------------------------------------------------
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port)
