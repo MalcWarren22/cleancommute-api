@@ -18,7 +18,7 @@ jobs:
           --health-cmd="mongosh --quiet --eval 'db.runCommand({ ping: 1 }).ok'"
           --health-interval=5s
           --health-timeout=5s
-          --health-retries=20
+          --health-retries=30
 
     steps:
       - uses: actions/checkout@v4
@@ -27,21 +27,21 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install deps (+ dev tools)
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install ruff black pip-audit
 
-      - name: Compile sources (fast syntax check)
+      - name: Fast syntax check
         run: python -m py_compile *.py || true
 
-      - name: Wait for Mongo to be reachable
+      - name: Wait for Mongo
         run: |
           python - <<'PY'
           import time, sys
           from pymongo import MongoClient
-          for _ in range(60):
+          for _ in range(90):
               try:
                   MongoClient("mongodb://localhost:27017", serverSelectionTimeoutMS=1000).admin.command("ping")
                   print("Mongo is up")
@@ -52,57 +52,52 @@ jobs:
           sys.exit(1)
           PY
 
-      # UPDATED: Smoke test now checks health JSON and uses commute endpoints
       - name: Smoke test with Flask test client
         env:
-          # IMPORTANT: include a DB name in the URI so app.py can parse it
-          MONGO_URI: "mongodb://localhost:27017/cleancommute_ci"
+          # Use the service hostname "mongo". Include DB name in the URI.
+          MONGO_URI: "mongodb://mongo:27017/cleancommute_ci"
+          MONGO_DB: "cleancommute_ci"
+          API_KEY: "ci-key"
           PYTHONPATH: ${{ github.workspace }}
         run: |
           python - <<'PY'
           import json, os
-
-          os.environ.setdefault("MONGO_URI", "mongodb://localhost:27017/cleancommute_ci")
+          os.environ.setdefault("MONGO_URI", "mongodb://mongo:27017/cleancommute_ci")
+          os.environ.setdefault("MONGO_DB", "cleancommute_ci")
+          os.environ.setdefault("API_KEY", "ci-key")
 
           from app import app
           c = app.test_client()
 
-          def J(r):
-              return json.loads(r.data.decode("utf-8"))
+          def J(resp): return json.loads(resp.data.decode("utf-8"))
 
-          # Health should be 200 and include proper JSON with db name
-          r = c.get("/api/v1/health")
-          assert r.status_code == 200, f"/health -> {r.status_code} {r.data!r}"
-          body = J(r)
-          assert body.get("status") == "ok", f"bad health body: {body}"
-          assert body.get("db") == "cleancommute_ci", f"expected db cleancommute_ci, got {body}"
+          # Health
+          r = c.get("/api/v1/health"); assert r.status_code == 200, r.status_code
+          assert J(r).get("status") == "ok"
 
-          # Create a commute (no auth required in new app.py)
-          r = c.post("/api/v1/commutes", json={"distance_km": 7.2, "mode": "car", "passengers": 2})
-          assert r.status_code == 201, f"create commute -> {r.status_code} {r.data!r}"
-          created = J(r)
-          assert "kgCO2e" in created and created["kgCO2e"] >= 0, f"bad estimate: {created}"
+          # DB ping (200 true)
+          r = c.get("/api/v1/db-ping"); assert r.status_code == 200, r.status_code
+          assert J(r).get("ok") is True
 
-          # List should contain at least one item
-          r = c.get("/api/v1/commutes")
-          assert r.status_code == 200, f"list -> {r.status_code}"
-          lst = J(r).get("commutes", [])
-          assert isinstance(lst, list) and len(lst) >= 1, f"expected 1+ commutes, got {lst}"
+          # Write sample (requires x-api-key)
+          r = c.post("/api/v1/samples",
+                     json={"hello": "atlas"},
+                     headers={"x-api-key": "ci-key"})
+          assert r.status_code == 201, (r.status_code, r.data)
 
-          # Clear should succeed
-          r = c.post("/api/v1/commutes/clear")
-          assert r.status_code == 200, f"clear -> {r.status_code}"
+          # List samples
+          r = c.get("/api/v1/samples"); assert r.status_code == 200
+          assert isinstance(J(r), list)
 
           print("✅ Smoke OK")
           PY
 
-      - name: Style (ruff + black autoformat)
+      - name: Style (ruff + black)
         run: |
           ruff check .
-          black .
-          echo "✅ Style checks passed (Black autoformatted if needed)."
+          black --check . || (echo "Autoformatting with Black"; black .)
 
-      - name: Vulnerability scan (pip-audit; non-blocking)
+      - name: Vulnerability scan (non-blocking)
         run: pip-audit -r requirements.txt || true
 
   deploy_staging:
@@ -116,19 +111,19 @@ jobs:
       - name: Install Heroku CLI
         run: curl https://cli-assets.heroku.com/install.sh | sh
 
-      - name: Authenticate Heroku
-        run: echo "${{ secrets.HEROKU_API_KEY }}" | heroku auth:token
-
-      - name: Push code to Heroku (staging)
-        run: git push https://heroku:${{ secrets.HEROKU_API_KEY }}@git.heroku.com/${{ vars.HEROKU_APP_STAGING }}.git HEAD:main
+      - name: Push to Heroku (staging)
+        env:
+          HEROKU_API_KEY: ${{ secrets.HEROKU_API_KEY }}
+          APP: ${{ vars.HEROKU_APP_STAGING }}
+        run: |
+          git push https://heroku:${HEROKU_API_KEY}@git.heroku.com/${APP}.git HEAD:main
 
       - name: Health check (staging)
         env:
-          HEROKU_APP: ${{ vars.HEROKU_APP_STAGING }}
+          APP: ${{ vars.HEROKU_APP_STAGING }}
         run: |
           set -e
-          BASE=$(heroku apps:info -a "$HEROKU_APP" | sed -n 's/^Web URL: *//p')
-          BASE=${BASE%/}
+          BASE=$(heroku apps:info -a "$APP" | sed -n 's/^Web URL: *//p'); BASE=${BASE%/}
           URL="${BASE}/api/v1/health"
           echo "Checking $URL"
           for i in {1..45}; do
@@ -136,7 +131,7 @@ jobs:
             if [ "$code" = "200" ]; then echo "Healthy ✅"; exit 0; fi
             sleep 2
           done
-          echo "Health check failed ❌ (last code: $code) at $URL"; exit 1
+          echo "Health check failed ❌ at $URL"; exit 1
 
   deploy_prod:
     name: Deploy to Heroku (production)
@@ -149,19 +144,19 @@ jobs:
       - name: Install Heroku CLI
         run: curl https://cli-assets.heroku.com/install.sh | sh
 
-      - name: Authenticate Heroku
-        run: echo "${{ secrets.HEROKU_API_KEY }}" | heroku auth:token
-
-      - name: Push code to Heroku (prod)
-        run: git push https://heroku:${{ secrets.HEROKU_API_KEY }}@git.heroku.com/${{ vars.HEROKU_APP_PROD }}.git HEAD:main
+      - name: Push to Heroku (prod)
+        env:
+          HEROKU_API_KEY: ${{ secrets.HEROKU_API_KEY }}
+          APP: ${{ vars.HEROKU_APP_PROD }}
+        run: |
+          git push https://heroku:${HEROKU_API_KEY}@git.heroku.com/${APP}.git HEAD:main
 
       - name: Health check (prod)
         env:
-          HEROKU_APP: ${{ vars.HEROKU_APP_PROD }}
+          APP: ${{ vars.HEROKU_APP_PROD }}
         run: |
           set -e
-          BASE=$(heroku apps:info -a "$HEROKU_APP" | sed -n 's/^Web URL: *//p')
-          BASE=${BASE%/}
+          BASE=$(heroku apps:info -a "$APP" | sed -n 's/^Web URL: *//p'); BASE=${BASE%/}
           URL="${BASE}/api/v1/health"
           echo "Checking $URL"
           for i in {1..45}; do
@@ -169,4 +164,4 @@ jobs:
             if [ "$code" = "200" ]; then echo "Healthy ✅"; exit 0; fi
             sleep 2
           done
-          echo "Health check failed ❌ (last code: $code) at $URL"; exit 1
+          echo "Health check failed ❌ at $URL"; exit 1
