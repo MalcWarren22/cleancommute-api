@@ -6,6 +6,23 @@ from flask import Flask, jsonify, request, abort
 from flask_cors import CORS
 from pymongo import MongoClient
 from werkzeug.middleware.proxy_fix import ProxyFix
+import sentry_sdk  # NEW
+from sentry_sdk.integrations.flask import FlaskIntegration  # NEW
+
+# ------------------------------------------------------------
+# Sentry setup (must come before app init)
+# ------------------------------------------------------------
+SENTRY_DSN = os.getenv(
+    "SENTRY_DSN",
+    "https://91ab82ceac9b6f932faa7c8b77369dfb@o4510193691852800.ingest.us.sentry.io/4510193702076416"
+)
+if SENTRY_DSN:
+    sentry_sdk.init(
+        dsn=SENTRY_DSN,
+        integrations=[FlaskIntegration()],
+        traces_sample_rate=1.0,
+        send_default_pii=True,
+    )
 
 # ------------------------------------------------------------
 # Config & logging
@@ -178,6 +195,14 @@ def clear_commutes():
         return jsonify({"error": "Database unavailable"}), 503
     res = db.commutes.delete_many({})
     return jsonify({"deleted": res.deleted_count}), 200
+
+# ------------------------------------------------------------
+# Test route (Sentry verification)
+# ------------------------------------------------------------
+@app.get("/api/v1/test-error")
+def test_error():
+    division_by_zero = 1 / 0  # intentionally raise an error
+    return jsonify({"result": division_by_zero})
 
 # ------------------------------------------------------------
 # Introspection (optional)
