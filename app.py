@@ -382,7 +382,6 @@ def test_error():
     if request.headers.get("x-admin-key") != os.getenv("ADMIN_KEY"):
         abort(403)
     1 / 0  # intentionally trigger an error
-
 # ------------------------------------------------------------
 # Introspection (optional)
 # ------------------------------------------------------------
@@ -400,3 +399,4 @@ def list_routes():
 # ------------------------------------------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
+
