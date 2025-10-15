@@ -1,4 +1,3 @@
-# app.py
 import os
 import logging
 from typing import List
@@ -197,12 +196,21 @@ def clear_commutes():
     return jsonify({"deleted": res.deleted_count}), 200
 
 # ------------------------------------------------------------
-# Test route (Sentry verification)
+# Test route (Sentry verification, gated for safety)
 # ------------------------------------------------------------
-@app.get("/api/v1/test-error")
-def test_error():
-    division_by_zero = 1 / 0  # intentionally raise an error
-    return jsonify({"result": division_by_zero})
+if os.getenv("FLASK_ENV") == "production":
+    @app.get("/api/v1/test-error")
+    def test_error_prod_blocked():
+        abort(404)
+else:
+    @app.get("/api/v1/test-error")
+    def test_error():
+        # Only allow in staging and with admin key
+        if os.getenv("SENTRY_ENV", "staging") != "staging":
+            abort(404)
+        if request.headers.get("x-admin-key") != os.getenv("ADMIN_KEY"):
+            abort(403)
+        1 / 0  # intentionally trigger an error
 
 # ------------------------------------------------------------
 # Introspection (optional)
