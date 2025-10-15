@@ -198,19 +198,14 @@ def clear_commutes():
 # ------------------------------------------------------------
 # Test route (Sentry verification, gated for safety)
 # ------------------------------------------------------------
-if os.getenv("FLASK_ENV") == "production":
-    @app.get("/api/v1/test-error")
-    def test_error_prod_blocked():
+@app.get("/api/v1/test-error")
+def test_error():
+    # Only allow in staging and with admin key
+    if os.getenv("SENTRY_ENV") != "staging":
         abort(404)
-else:
-    @app.get("/api/v1/test-error")
-    def test_error():
-        # Only allow in staging and with admin key
-        if os.getenv("SENTRY_ENV", "staging") != "staging":
-            abort(404)
-        if request.headers.get("x-admin-key") != os.getenv("ADMIN_KEY"):
-            abort(403)
-        1 / 0  # intentionally trigger an error
+    if request.headers.get("x-admin-key") != os.getenv("ADMIN_KEY"):
+        abort(403)
+    1 / 0  # intentionally trigger an error
 
 # ------------------------------------------------------------
 # Introspection (optional)
