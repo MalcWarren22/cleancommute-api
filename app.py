@@ -7,6 +7,7 @@ from pymongo import MongoClient
 from werkzeug.middleware.proxy_fix import ProxyFix
 import sentry_sdk  # NEW
 from sentry_sdk.integrations.flask import FlaskIntegration  # NEW
+from datetime import datetime, timezone  # NEW
 
 # ------------------------------------------------------------
 # Sentry setup (must come before app init)
@@ -75,6 +76,15 @@ try:
     mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
     db = mongo_client[MONGO_DB_NAME]
     mongo_client.admin.command("ping")  # warm-up ping (non-fatal if except)
+
+    # ---- Commutes indexes for faster demos (idempotent) ----
+    try:
+        db.commutes.create_index([("created_at", 1)])
+        db.commutes.create_index([("kind", 1)])          # "estimate" | "plan" | "compare"
+        db.commutes.create_index([("mode", 1)])
+        log.info("Commutes indexes ensured.")
+    except Exception as idx_e:
+        log.warning("Could not ensure indexes: %s", idx_e)
 except Exception as e:
     log.error("Failed creating Mongo client: %s", e)
 
@@ -100,6 +110,9 @@ def _mongo_ok() -> bool:
         return True
     except Exception:
         return False
+
+def _now_utc():  # NEW helper
+    return datetime.now(timezone.utc)
 
 # ------------------------------------------------------------
 # Health / debug routes
@@ -194,6 +207,169 @@ def clear_commutes():
         return jsonify({"error": "Database unavailable"}), 503
     res = db.commutes.delete_many({})
     return jsonify({"deleted": res.deleted_count}), 200
+
+# ------------------------------------------------------------
+# CO₂ Estimate / Plan / Compare (presentation-ready)
+# ------------------------------------------------------------
+from emissions import estimate_emissions  # uses your existing module
+
+@app.post("/api/v1/commutes/estimate")
+def co2_estimate():
+    """
+    Estimate CO2e for a single trip.
+    Body JSON:
+    {
+      "mode": "car"|"car_gas"|"car_hybrid"|"rideshare"|"bus"|"train"|"subway"|"bike"|"walk",
+      "distance_km": 12.5,
+      "passengers": 1            # optional (applies to car-like modes)
+    }
+    """
+    require_key()
+    if not _mongo_ok():
+        return jsonify({"error": "Database unavailable"}), 503
+
+    payload = request.get_json(silent=True) or {}
+    mode = (payload.get("mode") or "car").lower()
+    distance_km = payload.get("distance_km")
+    passengers = payload.get("passengers", 1)
+
+    if distance_km is None:
+        abort(400, description="distance_km is required")
+
+    try:
+        est = estimate_emissions(float(distance_km), mode, passengers=int(passengers))
+    except Exception as e:
+        abort(400, description=str(e))
+
+    doc = {
+        "kind": "estimate",
+        "mode": est["mode"],
+        "distance_km": float(distance_km),
+        "passengers": est["passengers"],
+        "estimated": est["kgCO2e"],
+        "factor_kg_per_km": est["factor_kg_per_km"],
+        "created_at": _now_utc(),
+    }
+    db.commutes.insert_one(doc)
+
+    return jsonify({
+        "ok": True,
+        "data": {
+            "mode": est["mode"],
+            "distance_km": float(distance_km),
+            "passengers": est["passengers"],
+            "estimated_co2_kg": est["kgCO2e"],
+            "factor_kg_per_km": est["factor_kg_per_km"],
+        }
+    }), 201
+
+
+@app.post("/api/v1/commutes/plan")
+def co2_plan():
+    """
+    Simple multi-day plan (same distance each day).
+    Body JSON:
+    {
+      "mode": "car_hybrid",
+      "distance_km_per_day": 35,
+      "days": 7,
+      "passengers": 1
+    }
+    """
+    require_key()
+    if not _mongo_ok():
+        return jsonify({"error": "Database unavailable"}), 503
+
+    payload = request.get_json(silent=True) or {}
+    mode = (payload.get("mode") or "car").lower()
+    distance_per_day = payload.get("distance_km_per_day")
+    days = int(payload.get("days", 1))
+    passengers = int(payload.get("passengers", 1))
+
+    if distance_per_day is None:
+        abort(400, description="distance_km_per_day is required")
+    if days < 1:
+        days = 1
+
+    try:
+        per_day = estimate_emissions(float(distance_per_day), mode, passengers=passengers)
+        total = round(per_day["kgCO2e"] * days, 4)
+    except Exception as e:
+        abort(400, description=str(e))
+
+    doc = {
+        "kind": "plan",
+        "mode": per_day["mode"],
+        "distance_km_per_day": float(distance_per_day),
+        "days": days,
+        "passengers": per_day["passengers"],
+        "per_day_kg": per_day["kgCO2e"],
+        "total_kg": total,
+        "factor_kg_per_km": per_day["factor_kg_per_km"],
+        "created_at": _now_utc(),
+    }
+    db.commutes.insert_one(doc)
+
+    return jsonify({"ok": True, "data": {
+        "mode": per_day["mode"],
+        "distance_km_per_day": float(distance_per_day),
+        "days": days,
+        "passengers": per_day["passengers"],
+        "per_day_kg": per_day["kgCO2e"],
+        "total_kg": total,
+        "factor_kg_per_km": per_day["factor_kg_per_km"],
+    }}), 201
+
+
+@app.get("/api/v1/commutes/compare")
+def co2_compare():
+    """
+    Compare multiple modes on the same distance (ranked, lowest first).
+    Query: ?distance_km=12.5&modes=car,car_hybrid,rideshare,bus,train,subway,bike,walk&passengers=1
+    (unknown modes default to 'car' factor per your emissions.py rules)
+    """
+    require_key()
+    if not _mongo_ok():
+        return jsonify({"error": "Database unavailable"}), 503
+
+    distance_km = request.args.get("distance_km", type=float)
+    modes_csv = request.args.get("modes", type=str)
+    passengers = request.args.get("passengers", default=1, type=int)
+
+    if distance_km is None or not modes_csv:
+        abort(400, description="distance_km and modes (csv) are required")
+
+    modes = [m.strip().lower() for m in modes_csv.split(",") if m.strip()]
+    results = []
+    for m in modes:
+        try:
+            est = estimate_emissions(distance_km, m, passengers=passengers)
+            results.append({
+                "mode": est["mode"],
+                "distance_km": distance_km,
+                "passengers": est["passengers"],
+                "estimated_co2_kg": est["kgCO2e"],
+                "factor_kg_per_km": est["factor_kg_per_km"],
+            })
+        except Exception as e:
+            results.append({"mode": m, "error": str(e)})
+
+    # Persist snapshot for audit/demo
+    db.commutes.insert_one({
+        "kind": "compare",
+        "distance_km": distance_km,
+        "modes": modes,
+        "passengers": passengers,
+        "results": results,
+        "created_at": _now_utc(),
+    })
+
+    ranked = sorted(
+        [r for r in results if "estimated_co2_kg" in r],
+        key=lambda x: x["estimated_co2_kg"]
+    )
+
+    return jsonify({"ok": True, "data": {"ranked": ranked, "raw": results}}), 200
 
 # ------------------------------------------------------------
 # Test route (Sentry verification, gated for safety)
