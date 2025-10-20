@@ -1,24 +1,39 @@
 # app.py
+from __future__ import annotations
+
 import os
 import math
 import logging
-from datetime import datetime  # NEW
-from typing import List
+from datetime import datetime
+from typing import List, Optional
+
+import requests
 from flask import Flask, jsonify, request, abort
 from flask_cors import CORS
 from pymongo import MongoClient
 from werkzeug.middleware.proxy_fix import ProxyFix
+
 import sentry_sdk
 from sentry_sdk.integrations.flask import FlaskIntegration
-import requests  # NEW
-from emissions import estimate_emissions, _FACTORS  # (kept) factors + estimator
 
-# ------------------------------------------------------------
+# Local factors/estimator
+from emissions import estimate_emissions, _FACTORS  # noqa: F401  (factors are imported for completeness)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Load .env for local development (no effect in production)
+# ──────────────────────────────────────────────────────────────────────────────
+try:
+    from dotenv import load_dotenv  # type: ignore
+    load_dotenv()
+except Exception:
+    pass
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Sentry setup
-# ------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 SENTRY_DSN = os.getenv(
     "SENTRY_DSN",
-    "https://91ab82ceac9b6f932faa7c8b77369dfb@o4510193691852800.ingest.us.sentry.io/4510193702076416"
+    "https://91ab82ceac9b6f932faa7c8b77369dfb@o4510193691852800.ingest.us.sentry.io/4510193702076416",
 )
 if SENTRY_DSN:
     sentry_sdk.init(
@@ -28,9 +43,9 @@ if SENTRY_DSN:
         send_default_pii=True,
     )
 
-# ------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 # Config & logging
-# ------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL)
 log = logging.getLogger("cleancommute")
@@ -46,13 +61,14 @@ ALLOW_CLEAR = str(os.getenv("ALLOW_CLEAR", "false")).lower() == "true"
 DEFAULT_LIMITS = os.getenv("DEFAULT_LIMITS", "200 per minute")
 LIMITER_STORAGE_URI = os.getenv("LIMITER_STORAGE_URI", "memory://")
 
-# Google Maps platform key (Directions/Geocoding/Places/JS)
-# Uses env var first; falls back to the key you provided.
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
+# Google Maps Platform server-side key (Directions/Geocoding/Places)
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+if not GOOGLE_API_KEY:
+    log.error("GOOGLE_API_KEY not set in environment. Google routing will be disabled.")
 
-# ------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 # Flask app setup
-# ------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_port=1, x_prefix=1)
 
@@ -61,8 +77,8 @@ CORS(app, resources={r"/api/*": {"origins": cors_origins}}, supports_credentials
 
 # Optional rate limiter
 try:
-    from flask_limiter import Limiter
-    from flask_limiter.util import get_remote_address
+    from flask_limiter import Limiter  # type: ignore
+    from flask_limiter.util import get_remote_address  # type: ignore
 
     limiter = Limiter(
         key_func=get_remote_address,
@@ -72,12 +88,12 @@ try:
     )
     log.info("Rate limiting enabled with %s via %s", DEFAULT_LIMITS, LIMITER_STORAGE_URI)
 except Exception as e:
-    limiter = None
+    limiter = None  # type: ignore
     log.info("Rate limiting not enabled (%s). Continuing without limiter.", e)
 
-# ------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 # Mongo client
-# ------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 mongo_client = None
 db = None
 try:
@@ -87,9 +103,9 @@ try:
 except Exception as e:
     log.error("Failed creating Mongo client: %s", e)
 
-# ------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 # Helpers
-# ------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 def require_key() -> None:
     if not API_KEY:
         abort(500, description="Server not configured with API_KEY")
@@ -106,8 +122,7 @@ def _mongo_ok() -> bool:
         return False
 
 # ----------------------------- Google helpers ------------------------------
-def _haversine_km(a, b):
-    # a=(lat,lon) b=(lat,lon) deg
+def _haversine_km(a: tuple[float, float] | None, b: tuple[float, float] | None) -> float:
     if not a or not b:
         return 0.0
     lat1, lon1 = map(math.radians, a)
@@ -115,18 +130,13 @@ def _haversine_km(a, b):
     dlat = lat2 - lat1
     dlon = lon2 - lon1
     R = 6371.0088
-    h = (math.sin(dlat/2)**2 + math.cos(lat1)*math.cos(lat2)*math.sin(dlon/2)**2)
+    h = (math.sin(dlat/2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2) ** 2)
     return 2 * R * math.asin(math.sqrt(h))
 
-def _directions(origin_str: str, dest_str: str, mode: str, *, transit_mode: str | None = None):
+def _directions(origin_str: str, dest_str: str, mode: str, *, transit_mode: Optional[str] = None) -> dict:
     """
-    Call Google Directions. Returns dict:
-    {
-      "ok": bool,
-      "distance_km": float|None,
-      "duration_min": float|None,
-      "polyline": str|None
-    }
+    Call Google Directions. Returns:
+      { ok, distance_km, duration_min, polyline }
     """
     if not GOOGLE_API_KEY:
         return {"ok": False, "distance_km": None, "duration_min": None, "polyline": None}
@@ -183,9 +193,9 @@ def _offline_time_min(distance_km: float, mode: str) -> float:
     oh = OVERHEAD.get(mode, 0.0)
     return round(oh + (distance_km / sp) * 60.0, 1)
 
-# ------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 # Health / diagnostics
-# ------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
     return jsonify({
@@ -219,9 +229,9 @@ def health_v1():
 def db_ping_v1():
     return db_ping_root()
 
-# ------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 # Sample routes
-# ------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 @app.post("/api/v1/samples")
 def add_sample():
     require_key()
@@ -248,9 +258,9 @@ def clear_samples():
     res = db.samples.delete_many({})
     return jsonify({"deleted": res.deleted_count}), 200
 
-# ------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 # Commute routes
-# ------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 @app.post("/api/v1/commutes")
 def add_commute():
     require_key()
@@ -277,9 +287,9 @@ def clear_commutes():
     res = db.commutes.delete_many({})
     return jsonify({"deleted": res.deleted_count}), 200
 
-# ------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 # Auto-compare route 🚀 (Google-powered distance/time per mode)
-# ------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 @app.post("/api/v1/commutes/auto-compare")
 def auto_compare():
     """
@@ -306,8 +316,8 @@ def auto_compare():
         {"mode": "walk",        "gmode": "walking",  "tmode": None},
     ]
 
-    results = []
-    base_distance_for_log = None
+    results: list[dict] = []
+    base_distance_for_log: Optional[float] = None
 
     for item in plan:
         m = item["mode"]
@@ -317,8 +327,8 @@ def auto_compare():
         resp = _directions(origin, destination, gmode, transit_mode=tmode)
 
         if resp["ok"] and resp["distance_km"]:
-            distance_km = resp["distance_km"]
-            duration_min = resp["duration_min"]
+            distance_km = float(resp["distance_km"])
+            duration_min = float(resp["duration_min"])
         else:
             # Minimal fallback if Directions fails completely
             distance_km = 1.0
@@ -339,7 +349,7 @@ def auto_compare():
             "source": est["source"],
         })
 
-    # Optional realism filter
+    # Optional realism filter for human-powered modes
     REALISM_LIMITS = {"walk": 3.2, "bike": 4.8}
     filtered, removed = [], []
     total_dist = base_distance_for_log or 0.0
@@ -350,12 +360,13 @@ def auto_compare():
             continue
         filtered.append(r)
 
-    # Persist (privacy-safe summary)
+    # Persist summary (privacy-safe)
     if _mongo_ok():
         try:
             db.commutes.insert_one({
                 "kind": "auto_compare",
-                "origin": origin, "destination": destination,
+                "origin": origin,
+                "destination": destination,
                 "passengers": passengers,
                 "distance_km": total_dist,
                 "results": filtered,
@@ -374,9 +385,9 @@ def auto_compare():
         "removed_notes": " ; ".join(removed),
     }), 200
 
-# ------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 # Test route for Sentry
-# ------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 @app.get("/api/v1/test-error")
 def test_error():
     if os.getenv("SENTRY_ENV") != "staging":
@@ -385,9 +396,9 @@ def test_error():
         abort(403)
     1 / 0  # intentional error
 
-# ------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 # Routes list
-# ------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 @app.get("/_routes")
 def list_routes():
     rules = []
@@ -397,8 +408,8 @@ def list_routes():
     rules.sort(key=lambda x: x["rule"])
     return jsonify(rules), 200
 
-# ------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 # Entrypoint
-# ------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
