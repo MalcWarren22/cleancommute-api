@@ -48,7 +48,7 @@ LIMITER_STORAGE_URI = os.getenv("LIMITER_STORAGE_URI", "memory://")
 
 # Google Maps platform key (Directions/Geocoding/Places/JS)
 # Uses env var first; falls back to the key you provided.
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "AIzaSyDvyc92TwH7na6-GEBwlly35o39psDcWdI")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 
 # ------------------------------------------------------------
 # Flask app setup
