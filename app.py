@@ -1,5 +1,8 @@
+# app.py
 import os
+import math
 import logging
+from datetime import datetime  # NEW
 from typing import List
 from flask import Flask, jsonify, request, abort
 from flask_cors import CORS
@@ -7,9 +10,8 @@ from pymongo import MongoClient
 from werkzeug.middleware.proxy_fix import ProxyFix
 import sentry_sdk
 from sentry_sdk.integrations.flask import FlaskIntegration
-from datetime import datetime, timezone
-from emissions import estimate_emissions
-from distance import get_distance_km
+import requests  # NEW
+from emissions import estimate_emissions, _FACTORS  # (kept) factors + estimator
 
 # ------------------------------------------------------------
 # Sentry setup
@@ -44,8 +46,12 @@ ALLOW_CLEAR = str(os.getenv("ALLOW_CLEAR", "false")).lower() == "true"
 DEFAULT_LIMITS = os.getenv("DEFAULT_LIMITS", "200 per minute")
 LIMITER_STORAGE_URI = os.getenv("LIMITER_STORAGE_URI", "memory://")
 
+# Google Maps platform key (Directions/Geocoding/Places/JS)
+# Uses env var first; falls back to the key you provided.
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "AIzaSyDvyc92TwH7na6-GEBwlly35o39psDcWdI")
+
 # ------------------------------------------------------------
-# Flask app
+# Flask app setup
 # ------------------------------------------------------------
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_port=1, x_prefix=1)
@@ -53,7 +59,7 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_port=1, x_prefix=1)
 cors_origins: List[str] = [FRONTEND_ORIGIN] if FRONTEND_ORIGIN else ["*"]
 CORS(app, resources={r"/api/*": {"origins": cors_origins}}, supports_credentials=False)
 
-# Optional rate limiting
+# Optional rate limiter
 try:
     from flask_limiter import Limiter
     from flask_limiter.util import get_remote_address
@@ -81,11 +87,6 @@ try:
 except Exception as e:
     log.error("Failed creating Mongo client: %s", e)
 
-log.info(
-    "ENV → FLASK_ENV=%s | ALLOW_CLEAR=%s | MONGO_URI=%s | MONGO_DB=%s | FRONTEND_ORIGIN=%s",
-    FLASK_ENV, ALLOW_CLEAR, MONGO_URI, MONGO_DB_NAME, FRONTEND_ORIGIN,
-)
-
 # ------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------
@@ -104,11 +105,86 @@ def _mongo_ok() -> bool:
     except Exception:
         return False
 
-def _now_utc():
-    return datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
+# ----------------------------- Google helpers ------------------------------
+def _haversine_km(a, b):
+    # a=(lat,lon) b=(lat,lon) deg
+    if not a or not b:
+        return 0.0
+    lat1, lon1 = map(math.radians, a)
+    lat2, lon2 = map(math.radians, b)
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    R = 6371.0088
+    h = (math.sin(dlat/2)**2 + math.cos(lat1)*math.cos(lat2)*math.sin(dlon/2)**2)
+    return 2 * R * math.asin(math.sqrt(h))
+
+def _directions(origin_str: str, dest_str: str, mode: str, *, transit_mode: str | None = None):
+    """
+    Call Google Directions. Returns dict:
+    {
+      "ok": bool,
+      "distance_km": float|None,
+      "duration_min": float|None,
+      "polyline": str|None
+    }
+    """
+    if not GOOGLE_API_KEY:
+        return {"ok": False, "distance_km": None, "duration_min": None, "polyline": None}
+
+    url = "https://maps.googleapis.com/maps/api/directions/json"
+    params = {
+        "origin": origin_str,
+        "destination": dest_str,
+        "mode": mode,  # driving | transit | bicycling | walking
+        "alternatives": "false",
+        "key": GOOGLE_API_KEY,
+    }
+    if mode in ("driving", "transit"):
+        params["departure_time"] = "now"
+    if mode == "driving":
+        params["traffic_model"] = "best_guess"
+    if mode == "transit" and transit_mode:
+        params["transit_mode"] = transit_mode  # bus | rail | subway
+
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        data = r.json()
+        if data.get("status") != "OK":
+            return {"ok": False, "distance_km": None, "duration_min": None, "polyline": None}
+
+        route = data["routes"][0]
+        leg = route["legs"][0]
+        dist_m = leg["distance"]["value"]
+        sec = (leg.get("duration_in_traffic") or leg["duration"])["value"]
+        poly = route.get("overview_polyline", {}).get("points")
+
+        return {
+            "ok": True,
+            "distance_km": round(dist_m / 1000.0, 3),
+            "duration_min": round(sec / 60.0, 1),
+            "polyline": poly,
+        }
+    except Exception as e:
+        log.warning("Directions error (%s): %s", mode, e)
+        return {"ok": False, "distance_km": None, "duration_min": None, "polyline": None}
+
+def _offline_time_min(distance_km: float, mode: str) -> float:
+    SPEED_KMH = {
+        "car": 35.0, "car_hybrid": 35.0,
+        "bus": 18.0, "train": 45.0, "subway": 30.0,
+        "bike": 15.5, "walk": 5.0,
+    }
+    OVERHEAD = {
+        "car": 5.0, "car_hybrid": 5.0,
+        "bus": 6.0, "train": 6.0, "subway": 6.0,
+        "bike": 2.0, "walk": 0.0,
+    }
+    sp = max(SPEED_KMH.get(mode, 30.0), 1e-6)
+    oh = OVERHEAD.get(mode, 0.0)
+    return round(oh + (distance_km / sp) * 60.0, 1)
 
 # ------------------------------------------------------------
-# Health / debug routes
+# Health / diagnostics
 # ------------------------------------------------------------
 @app.get("/")
 def root():
@@ -134,6 +210,7 @@ def db_ping_root():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
+# Versioned
 @app.get("/api/v1/health")
 def health_v1():
     return health_root()
@@ -143,7 +220,7 @@ def db_ping_v1():
     return db_ping_root()
 
 # ------------------------------------------------------------
-# Samples endpoints
+# Sample routes
 # ------------------------------------------------------------
 @app.post("/api/v1/samples")
 def add_sample():
@@ -172,7 +249,7 @@ def clear_samples():
     return jsonify({"deleted": res.deleted_count}), 200
 
 # ------------------------------------------------------------
-# Commutes endpoints
+# Commute routes
 # ------------------------------------------------------------
 @app.post("/api/v1/commutes")
 def add_commute():
@@ -201,7 +278,104 @@ def clear_commutes():
     return jsonify({"deleted": res.deleted_count}), 200
 
 # ------------------------------------------------------------
-# Test route (Sentry verification)
+# Auto-compare route 🚀 (Google-powered distance/time per mode)
+# ------------------------------------------------------------
+@app.post("/api/v1/commutes/auto-compare")
+def auto_compare():
+    """
+    Compare all modes with Google Directions distance/time for accuracy.
+    Driving uses live traffic (duration_in_traffic).
+    Transit returns separate rows for Bus/Rail/Subway when routable.
+    """
+    require_key()
+    data = request.get_json(silent=True) or {}
+    origin = data.get("origin")
+    destination = data.get("destination")
+    passengers = int(data.get("passengers", 1))
+
+    if not origin or not destination:
+        abort(400, description="origin and destination required")
+
+    plan = [
+        {"mode": "car",         "gmode": "driving",  "tmode": None},
+        {"mode": "car_hybrid",  "gmode": "driving",  "tmode": None},
+        {"mode": "bus",         "gmode": "transit",  "tmode": "bus"},
+        {"mode": "train",       "gmode": "transit",  "tmode": "rail"},
+        {"mode": "subway",      "gmode": "transit",  "tmode": "subway"},
+        {"mode": "bike",        "gmode": "bicycling","tmode": None},
+        {"mode": "walk",        "gmode": "walking",  "tmode": None},
+    ]
+
+    results = []
+    base_distance_for_log = None
+
+    for item in plan:
+        m = item["mode"]
+        gmode = item["gmode"]
+        tmode = item["tmode"]
+
+        resp = _directions(origin, destination, gmode, transit_mode=tmode)
+
+        if resp["ok"] and resp["distance_km"]:
+            distance_km = resp["distance_km"]
+            duration_min = resp["duration_min"]
+        else:
+            # Minimal fallback if Directions fails completely
+            distance_km = 1.0
+            duration_min = _offline_time_min(distance_km, m)
+
+        if base_distance_for_log is None and distance_km:
+            base_distance_for_log = distance_km
+
+        est = estimate_emissions(distance_km, m, passengers=passengers)
+
+        results.append({
+            "mode": est["mode"],
+            "factor_kg_per_km": est["factor_kg_per_km"],
+            "kgCO2e": est["kgCO2e"],
+            "passengers": est["passengers"],
+            "distance_km": distance_km,
+            "time_min": duration_min,
+            "source": est["source"],
+        })
+
+    # Optional realism filter
+    REALISM_LIMITS = {"walk": 3.2, "bike": 4.8}
+    filtered, removed = [], []
+    total_dist = base_distance_for_log or 0.0
+    for r in results:
+        lim = REALISM_LIMITS.get(r["mode"])
+        if lim and total_dist > lim:
+            removed.append(f"Excluded {r['mode'].title()} (> {lim} km)")
+            continue
+        filtered.append(r)
+
+    # Persist (privacy-safe summary)
+    if _mongo_ok():
+        try:
+            db.commutes.insert_one({
+                "kind": "auto_compare",
+                "origin": origin, "destination": destination,
+                "passengers": passengers,
+                "distance_km": total_dist,
+                "results": filtered,
+                "removed_notes": " ; ".join(removed),
+                "ts": datetime.utcnow().isoformat() + "Z",
+            })
+        except Exception as e:
+            log.warning("Failed to insert commute doc: %s", e)
+
+    return jsonify({
+        "ok": True,
+        "origin": origin,
+        "destination": destination,
+        "distance_km": total_dist,
+        "results": filtered,
+        "removed_notes": " ; ".join(removed),
+    }), 200
+
+# ------------------------------------------------------------
+# Test route for Sentry
 # ------------------------------------------------------------
 @app.get("/api/v1/test-error")
 def test_error():
@@ -209,77 +383,10 @@ def test_error():
         abort(404)
     if request.headers.get("x-admin-key") != os.getenv("ADMIN_KEY"):
         abort(403)
-    1 / 0  # Intentional crash
+    1 / 0  # intentional error
 
 # ------------------------------------------------------------
-# Auto-comparison route (NEW)
-# ------------------------------------------------------------
-@app.post("/api/v1/commutes/auto-compare")
-def auto_compare():
-    """
-    Compare CO₂ emissions automatically between two locations.
-    Input JSON:
-      {
-        "origin": "Norfolk State University",
-        "destination": "Downtown Norfolk",
-        "passengers": 1
-      }
-    """
-    require_key()
-    data = request.get_json(silent=True) or {}
-
-    origin = data.get("origin")
-    destination = data.get("destination")
-    passengers = data.get("passengers", 1)
-
-    if not origin or not destination:
-        return jsonify({"error": "origin and destination required"}), 400
-
-    # Step 1: distance
-    distance_km = get_distance_km(origin, destination)
-    if not distance_km:
-        distance_km = 5.0  # fallback to prevent crash
-
-    # Step 2: run emissions
-    modes = ["car", "car_hybrid", "rideshare", "bus", "train", "subway", "bike", "walk"]
-    results = []
-    for mode in modes:
-        try:
-            result = estimate_emissions(mode, distance_km, passengers)
-            if result:
-                results.append(result)
-        except Exception as e:
-            log.warning("Emission calc failed for %s: %s", mode, e)
-
-    ranked = sorted(results, key=lambda x: x["estimated_co2_kg"])
-    best = ranked[0] if ranked else None
-
-    # Step 3: store in Mongo
-    try:
-        db.commutes.insert_one({
-            "kind": "auto_compare",
-            "origin": origin,
-            "destination": destination,
-            "distance_km": distance_km,
-            "passengers": passengers,
-            "results": results,
-            "best_option": best,
-            "created_at": _now_utc(),
-        })
-    except Exception as e:
-        log.warning("DB insert failed: %s", e)
-
-    return jsonify({
-        "ok": True,
-        "origin": origin,
-        "destination": destination,
-        "distance_km": round(distance_km, 2),
-        "ranked": ranked,
-        "best_option": best,
-    }), 200
-
-# ------------------------------------------------------------
-# Introspection
+# Routes list
 # ------------------------------------------------------------
 @app.get("/_routes")
 def list_routes():
